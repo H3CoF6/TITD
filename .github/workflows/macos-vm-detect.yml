@@ -8,6 +8,14 @@ on:
         description: '逗号分隔的版本过滤（留空 = 全部）'
         required: false
         default: ''
+      only_arch:
+        description: '只跑某个架构（intel / arm / 留空 = 两个都跑）'
+        required: false
+        default: ''
+  # 非默认分支上的 workflow_dispatch 不会出现在手动触发列表里，
+  # 所以再挂一个 push 触发，推到本分支就自动跑。
+  push:
+    branches: [weq/vm-detect]
 
 jobs:
   # 生成 matrix：版本 × 架构
@@ -19,6 +27,7 @@ jobs:
       - id: gen
         env:
           FILTER: ${{ inputs.versions }}
+          ONLY_ARCH: ${{ inputs.only_arch }}
         run: |
           python3 - <<'PY'
           import json, os, re
@@ -46,10 +55,15 @@ jobs:
 
           # intel 跑在 macos-13（x86_64），arm 跑在 macos-14（arm64），
           # 这样两个架构都能做动态签名验证。
-          runners = {"intel": "macos-13", "arm": "macos-14"}
+          # macOS 13/14 已退役；当前可用的是 macos-15（arm64）和
+          # macos-15-intel（x64）。
+          runners = {"intel": "macos-15-intel", "arm": "macos-15"}
+          only = os.environ.get("ONLY_ARCH", "").strip()
           include = []
           for v in versions:
               for arch, runner in runners.items():
+                  if only and arch != only:
+                      continue
                   include.append({
                       "version": v,
                       "arch": arch,

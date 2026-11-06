@@ -97,9 +97,16 @@ x86_64 的地址都与 lldb 断点实测一致。
 
 ## GitHub Actions
 
-`.github/workflows/macos-vm-detect.yml` 手动触发，每个版本 × 架构一个 job：
+`.github/workflows/macos-vm-detect.yml` 每个版本 × 架构一个 job：
 
-- `intel` 跑在 `macos-13`（x86_64 runner）
-- `arm` 跑在 `macos-14`（arm64 runner）
+- `intel` 跑在 `macos-15-intel`（x64 runner）
+- `arm` 跑在 `macos-15`（arm64 runner）
+
+（macOS 13/14 的 runner 已退役。）
+
+触发方式：
+
+- `workflow_dispatch`：非默认分支上不会出现在手动触发列表，需在默认分支上才有。
+- `push`：推到 `weq/vm-detect` 分支时自动跑。
 
 两个架构都能做动态验证。结果写入 job summary，并上传 artifact。
