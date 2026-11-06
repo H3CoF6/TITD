@@ -1,0 +1,247 @@
+name: Torrent web-seed 演练
+
+# 在真实 CI 里验证「把 WeQ Release 的全部产物打成磁力种子 + web seed 兜底
+# + magnet 发 QQ 群」这条链路，不必等 30 分钟的真 release。
+#
+# ── 为什么是「每个产物一个单文件种子」而不是一个大种子 ──
+#
+# 实测出来的一组坑（aria2 1.37 与 libtorrent 2.1 行为一致）：
+#   - 多文件种子用字符串形式的 url-list：客户端拼
+#     <url-list>/<info.name>/<相对路径>。要求 web seed 端有 <种子名>/ 这层目录。
+#   - 多文件种子用数组形式的 url-list：aria2 拿每个数组项当前缀，与每个文件
+#     做笛卡尔积，直接全 404。
+#   - 单文件种子用数组形式的 url-list：URL 被当作该文件的**精确地址**原样使用。
+#     ✓ 实测从 GitHub Release 拉到 9.9MiB/s，sha256 与原件一致。
+#
+# GitHub Release 的资产是平铺的（没有 <种子名>/ 那层目录），所以多文件种子
+# 没法正确映射，只能一个产物一个种子。
+#
+# ── 另一个前提 ──
+# Actions runner 跑完即销毁，没有常驻做种者；种子必须内嵌 web seed，否则
+# 发出去的 magnet 就是死链。已实测 GitHub Release 直链支持 Range（206 +
+# Content-Range），而 BEP 19 正是按 piece 发 Range 取数。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '产物来源仓库'
+        default: 'weq-devs/WeQ'
+        required: true
+      source_tag:
+        description: '产物来源 tag'
+        default: 'v2.4.0'
+        required: true
+      piece_size:
+        description: 'BT piece 大小（2 的幂，建议 4MiB）'
+        default: '4MiB'
+        required: true
+      e2e_pattern:
+        description: '端到端下载验证挑哪个产物（shell glob）'
+        default: 'weq-web-*-linux-x64.tar.gz'
+        required: true
+  push:
+    branches: [drill/torrent-webseed]
+  pull_request:
+    branches: [drill/torrent-webseed]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: ${{ inputs.source_repo || 'weq-devs/WeQ' }}
+  SOURCE_TAG: ${{ inputs.source_tag || 'v2.4.0' }}
+  PIECE_SIZE: ${{ inputs.piece_size || '4MiB' }}
+  E2E_PATTERN: ${{ inputs.e2e_pattern || 'weq-web-*-linux-x64.tar.gz' }}
+  DIST: dist/release
+  TORRENTS: dist/torrents
+  URL_BASE: https://github.com/${{ inputs.source_repo || 'weq-devs/WeQ' }}/releases/download/${{ inputs.source_tag || 'v2.4.0' }}
+
+jobs:
+  build-torrent:
+    runs-on: ubuntu-latest
+    outputs:
+      file_count: ${{ steps.make.outputs.file_count }}
+      total_bytes: ${{ steps.make.outputs.total_bytes }}
+      torrent_total_bytes: ${{ steps.make.outputs.torrent_total_bytes }}
+      magnets_file: ${{ steps.make.outputs.magnets_file }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 拉取 Release 全部产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST" "$TORRENTS"
+          gh release download "$SOURCE_TAG" --repo "$SOURCE_REPO" --dir "$DIST"
+          echo "== 产物清单 =="
+          ls -la "$DIST"
+          echo "总大小: $(du -sh "$DIST" | cut -f1)"
+
+      - name: 每个产物生成一个带 web seed 的种子
+        id: make
+        run: |
+          set -euo pipefail
+          node scripts/make-torrent.mjs \
+            --dir "$DIST" \
+            --out-dir "$TORRENTS" \
+            --url-base "$URL_BASE" \
+            --piece-size "$PIECE_SIZE"
+
+      # 独立校验：从零解 bencode、重算 piece、核对 infohash 与 web seed URL。
+      - name: 独立校验全部种子
+        run: |
+          set -euo pipefail
+          node scripts/verify-torrent.mjs \
+            --torrent-dir "$TORRENTS" \
+            --dist "$DIST" \
+            --url-base "$URL_BASE"
+
+      # 第三方真值：用 libtorrent（不是我们的解析器）把每个种子读一遍。
+      - name: libtorrent 交叉解析
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-libtorrent
+          python3 - "$TORRENTS" <<'PY'
+          import glob
+          import libtorrent as lt
+          import sys
+
+          files = sorted(glob.glob(f"{sys.argv[1]}/*.torrent"))
+          assert files, "没有种子"
+          for path in files:
+              ti = lt.torrent_info(path)
+              seeds = [d["url"] for d in ti.web_seeds()]
+              assert ti.num_files() == 1, f"{path}: 不是单文件种子"
+              assert seeds, f"{path}: 缺 web seed"
+              assert seeds[0].endswith("/" + ti.name()), f"{path}: web seed 不是精确 URL: {seeds[0]}"
+              print(f"✓ {ti.name():44s} {ti.total_size():>12,}  "
+                    f"{ti.num_pieces():>3}块@{ti.piece_length()//1024}KiB  {ti.info_hash()}")
+          print(f"\n全部 {len(files)} 个种子 libtorrent 解析通过")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: torrents
+          path: ${{ env.TORRENTS }}
+
+      - name: 汇总
+        run: |
+          set -euo pipefail
+          {
+            echo "### 种子生成结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 产物数 | ${{ steps.make.outputs.file_count }} |"
+            echo "| 产物总大小 | $(numfmt --to=iec ${{ steps.make.outputs.total_bytes }}) |"
+            echo "| 种子总大小 | ${{ steps.make.outputs.torrent_total_bytes }} 字节 |"
+            echo ""
+            echo "<details><summary>磁力链接清单</summary>"
+            echo ""
+            echo '```'
+            sed 's/\t.*\t/\n/' "${{ steps.make.outputs.magnets_file }}"
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # 关掉 DHT / LPD / tracker，只靠 web seed 拉一个产物，再与原件比 sha256。
+  e2e-webseed:
+    needs: [build-torrent]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: torrents
+          path: dist/torrents
+
+      - name: 装 aria2
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+
+      - name: 挑一个种子做端到端验证
+        id: pick
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2053  # 这里就是要 glob 匹配，不是正则
+          NAME=""
+          for t in dist/torrents/*.torrent; do
+            base=$(basename "$t" .torrent)
+            if [[ "$base" == $E2E_PATTERN ]]; then NAME="$base"; break; fi
+          done
+          test -n "$NAME" || { echo "::error::没有匹配 $E2E_PATTERN 的种子"; ls dist/torrents; exit 1; }
+          echo "目标: $NAME ($(stat -c%s "dist/torrents/$NAME.torrent") 字节的种子)"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: 仅靠 web seed 下载
+        run: |
+          set -euo pipefail
+          NAME='${{ steps.pick.outputs.name }}'
+          mkdir -p /tmp/dl
+          # 种子里没有 tracker，DHT / LPD 又都关了，peer 数必然是 0，
+          # 唯一数据来源就是 web seed。能下完 => web seed 端到端可用。
+          timeout 900 aria2c \
+            --dir=/tmp/dl \
+            --seed-time=0 \
+            --enable-dht=false \
+            --bt-enable-lpd=false \
+            --console-log-level=notice \
+            --summary-interval=20 \
+            --max-connection-per-server=8 \
+            "dist/torrents/$NAME.torrent" 2>&1 | tail -20
+
+      - name: 与 Release 原件比对
+        run: |
+          set -euo pipefail
+          NAME='${{ steps.pick.outputs.name }}'
+          SRC=$(find /tmp/dl -name "$NAME" -type f | head -1)
+          test -n "$SRC" || { echo "::error::没找到下载结果"; find /tmp/dl -type f; exit 1; }
+          echo "web seed 下载到: $SRC ($(stat -c%s "$SRC") 字节)"
+
+          TMP=$(mktemp -d)
+          gh release download "$SOURCE_TAG" --repo "$SOURCE_REPO" --pattern "$NAME" --dir "$TMP"
+
+          A=$(sha256sum "$SRC" | cut -d' ' -f1)
+          B=$(sha256sum "$TMP/$NAME" | cut -d' ' -f1)
+          echo "web-seed 下载: $A"
+          echo "release 原件: $B"
+          test "$A" = "$B" || { echo "::error::哈希不一致，种子或 web seed 有问题"; exit 1; }
+          echo "✅ 仅靠 web seed 下载的内容与 Release 原件逐字节一致"
+
+  # 不真发群，只把最终文案打出来，便于肉眼确认格式和长度。
+  qq-preview:
+    needs: [build-torrent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: torrents
+          path: dist/torrents
+
+      - name: 预览 QQ 消息
+        run: |
+          set -euo pipefail
+          BODY=$(cat dist/torrents/MAGNETS.txt | awk -F'\t' '{printf "- %s [磁力](%s)\n", $1, $3}')
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### QQ 群消息预览
+
+          \`\`\`
+          ## WeQ $SOURCE_TAG 发布
+
+          全部产物已打包为磁力种子（内嵌 web seed，无需常驻做种）：
+
+          $BODY
+          \`\`\`
+
+          消息正文 ${#BODY} 字符
+          EOF
