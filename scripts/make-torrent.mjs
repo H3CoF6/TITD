@@ -184,9 +184,9 @@ export async function buildTorrent({ files, name, urlList, pieceLength, comment 
 
 // 为目录下每个文件各生成一个种子（单文件种子）。
 // 返回 [{ rel, size, encoded, infoHash, pieceCount }]。
-export async function buildPerFileTorrents({ dir, urlBase, pieceLength, comment }) {
-  const files = walkFiles(dir);
-  if (files.length === 0) throw new Error(`目录里没有文件: ${dir}`);
+export async function buildPerFileTorrents({ dir, urlBase, pieceLength, comment, exclude = [] }) {
+  const files = walkFiles(dir).filter((f) => !exclude.some((re) => re.test(f.rel)));
+  if (files.length === 0) throw new Error(`目录里没有可打包的文件: ${dir}`);
   const prefix = urlBase ? urlBase.replace(/\/+$/, '') : '';
 
   const out = [];
@@ -233,22 +233,25 @@ if (isMain) {
   const urlBase = arg('--url-base');
   const pieceLength = parseSize(arg('--piece-size', '1MiB'));
   const trackerArg = arg('--tracker', '');
+  const excludeArg = arg('--exclude', '');
 
   if (!dir || !outDir) {
     console.error(
       '用法: node scripts/make-torrent.mjs --dir <产物目录> --out-dir <输出目录> ' +
-      '[--url-base <web seed 前缀>] [--piece-size 1MiB] [--tracker URL]',
+      '[--url-base <web seed 前缀>] [--piece-size 1MiB] [--tracker URL] [--exclude 正则]',
     );
     process.exit(2);
   }
 
   const trackers = trackerArg ? trackerArg.split(',').filter(Boolean) : [];
+  const exclude = excludeArg ? excludeArg.split(',').map((s) => new RegExp(s)) : [];
   mkdirSync(outDir, { recursive: true });
 
   const results = await buildPerFileTorrents({
     dir,
     urlBase,
     pieceLength,
+    exclude,
     comment: urlBase ? `web seed: ${urlBase}` : undefined,
   });
 

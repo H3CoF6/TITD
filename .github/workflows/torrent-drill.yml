@@ -83,6 +83,8 @@ jobs:
           ls -la "$DIST"
           echo "总大小: $(du -sh "$DIST" | cut -f1)"
 
+      # latest*.yml / *.blockmap 是 electron-builder 的增量更新元数据，
+      # 用户不会拿它们当「产物」下载，也撑磁力清单，排除掉。
       - name: 每个产物生成一个带 web seed 的种子
         id: make
         run: |
@@ -91,7 +93,8 @@ jobs:
             --dir "$DIST" \
             --out-dir "$TORRENTS" \
             --url-base "$URL_BASE" \
-            --piece-size "$PIECE_SIZE"
+            --piece-size "$PIECE_SIZE" \
+            --exclude '^latest.*\.yml$,^.*\.blockmap$'
 
       # 独立校验：从零解 bencode、重算 piece、核对 infohash 与 web seed URL。
       - name: 独立校验全部种子
@@ -146,7 +149,8 @@ jobs:
             echo "<details><summary>磁力链接清单</summary>"
             echo ""
             echo '```'
-            sed 's/\t.*\t/\n/' "${{ steps.make.outputs.magnets_file }}"
+            # 每行是「文件名<TAB>大小<TAB>磁力」，只保留文件名和磁力。
+            awk -F'\t' '{ print $1 "\n" $3 "\n" }' "${{ steps.make.outputs.magnets_file }}"
             echo '```'
             echo ""
             echo "</details>"
