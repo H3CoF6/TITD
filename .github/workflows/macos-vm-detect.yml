@@ -32,7 +32,9 @@ jobs:
           python3 - <<'PY'
           import json, os, re
 
-          # 版本 -> dmg 下载地址（来自 downloads.json 整理）
+          # 版本 -> dmg 下载地址（来自 downloads.json 整理）。
+          # 注意：腾讯 CDN 只保留较新的版本。6.9.x 这批已全部 404，
+          # 仍然列出来是为了让 CI 如实报告“不可下载”，而不是悄悄消失。
           CATALOG = {
               "7.0.2.53644": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/837fcb63/QQ_v7.0.2.53644.dmg",
               "7.0.2.53489": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/5947d5d1/QQ_v7.0.2.53489.dmg",
@@ -102,17 +104,31 @@ jobs:
           ./macos_vm_locator 2>&1 | head -5 || true
 
       - name: 下载 dmg
+        id: download
         env:
           URL: ${{ matrix.url }}
+          VERSION: ${{ matrix.version }}
         run: |
-          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/qq"
-          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/qq/qq.dmg" "$URL"
+          code=$(curl -sSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/qq/qq.dmg" \
+                   -w '%{http_code}' "$URL" || echo 000)
+          echo "http=$code"
+          if [ "$code" != "200" ] || [ ! -s "$RUNNER_TEMP/qq/qq.dmg" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$VERSION 的 dmg 已不可下载（http=$code），腾讯 CDN 可能已删除该版本"
+            {
+              echo "### $VERSION / ${{ matrix.arch }}"
+              echo "dmg 已不可下载（http=$code），跳过。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
           ls -lh "$RUNNER_TEMP/qq/qq.dmg"
           file "$RUNNER_TEMP/qq/qq.dmg"
 
       - name: 解包并定位
         id: locate
+        if: steps.download.outputs.available == 'true'
         env:
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ matrix.version }}
