@@ -42,3 +42,13 @@ node scripts/verify-torrent.mjs --torrent-dir <种子目录> --dist <产物目�
 - 单文件种子的 `url-list` 必须用**数组**形式，里面放该文件的精确 URL。
   数组形式下客户端原样使用；字符串前缀形式反而会拼错。
 - 实测下载 9–15 MiB/s，sha256 与 Release 原件一致。
+
+### 必须发 .torrent 文件，不能只发 magnet
+
+`ws=` 参数（BEP 19）两家客户端都能正确解析，但**没用**：只给 magnet 时
+下载会永远卡在 `[METADATA]`，一个字节都下不来。原因是 web seed 只能传
+文件数据，没法在没有 peer 的情况下提供 metadata 交换 —— 而 metadata 里
+才有 pieces / 文件表。
+
+所以 QQ 群发的是 **zip 打包的 .torrent 文件**（14 个种子约 21KiB），
+正文里附文件名清单，不做成一行行磁力链接。

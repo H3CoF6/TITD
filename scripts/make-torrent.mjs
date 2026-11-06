@@ -208,13 +208,18 @@ export async function buildPerFileTorrents({ dir, urlBase, pieceLength, comment,
   return out;
 }
 
-export function magnetFor(infoHash, name, sizeBytes, trackers = []) {
-  const dn = encodeURIComponent(name);
+export function magnetFor(infoHash, name, sizeBytes, trackers = [], webSeeds = []) {
   const parts = [
     `magnet:?xt=urn:btih:${infoHash}`,
-    `dn=${dn}`,
-    // 用 tracker 做 peer 发现兜底；web seed 已在种子里，peer 为零也能靠 HTTP 拖完。
+    `dn=${encodeURIComponent(name)}`,
     ...trackers.map((t) => `tr=${encodeURIComponent(t)}`),
+    // ws= 是磁力链接自带 web seed 的唯一途径（BEP 19 + BEP 9 扩展）。
+    //
+    // .torrent 里写的 url-list 只在拿到 metadata 之后才生效，而 metadata
+    // 本身要靠 DHT/tracker 从 peer 取 —— 没有常驻做种者时根本取不到，
+    // 客户端还没看到 web seed 就已经失败了。所以发出去的 magnet 必须
+    // 自带 ws=，否则就是个死链。
+    ...webSeeds.map((w) => `ws=${encodeURIComponent(w)}`),
   ];
   return { magnet: parts.join('&'), size: sizeBytes };
 }
@@ -264,7 +269,8 @@ if (isMain) {
     const base = r.rel.replace(/\//g, '__');
     const path = join(outDir, `${base}.torrent`);
     writeFileSync(path, r.encoded);
-    const { magnet } = magnetFor(r.infoHash, r.rel, r.size, trackers);
+    const webSeeds = urlBase ? [`${urlBase.replace(/\/+$/, '')}/${r.rel}`] : [];
+    const { magnet } = magnetFor(r.infoHash, r.rel, r.size, trackers, webSeeds);
     lines.push({ rel: r.rel, size: r.size, infoHash: r.infoHash, magnet, path, torrentSize: r.encoded.length });
     totalBytes += r.size;
     totalTorrentBytes += r.encoded.length;

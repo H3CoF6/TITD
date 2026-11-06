@@ -129,6 +129,21 @@ jobs:
           print(f"\n全部 {len(files)} 个种子 libtorrent 解析通过")
           PY
 
+      # 发出去的是 .torrent 文件本身，不是磁力链接。
+      # 实测：只给 magnet 时，aria2 与 libtorrent 都会卡在 [METADATA] 一个
+      # 字节都下不来 —— web seed 只能传文件数据，没法在 peer 为零时提供
+      # metadata 交换。magnet 里的 ws= 参数（两者都能正确解析）也救不了，
+      # 因为解析出来了也还是拿不到 metadata。所以必须把 .torrent 发给用户。
+      #
+      # 14 个种子加起来才 ~17KiB，打进一个 zip 也不到 21KiB，远低于 QQ 限制。
+      - name: 打包种子
+        run: |
+          set -euo pipefail
+          cd "$TORRENTS"
+          zip -9 -q "WeQ-${SOURCE_TAG#v}-torrents.zip" ./*.torrent MAGNETS.txt
+          ls -la "WeQ-${SOURCE_TAG#v}-torrents.zip"
+          echo "压缩包大小: $(stat -c%s "WeQ-${SOURCE_TAG#v}-torrents.zip") 字节"
+
       - uses: actions/upload-artifact@v4
         with:
           name: torrents
@@ -145,6 +160,7 @@ jobs:
             echo "| 产物数 | ${{ steps.make.outputs.file_count }} |"
             echo "| 产物总大小 | $(numfmt --to=iec ${{ steps.make.outputs.total_bytes }}) |"
             echo "| 种子总大小 | ${{ steps.make.outputs.torrent_total_bytes }} 字节 |"
+            echo "| 待发压缩包 | $(stat -c%s "$TORRENTS/WeQ-${SOURCE_TAG#v}-torrents.zip") 字节 |"
             echo ""
             echo "<details><summary>磁力链接清单</summary>"
             echo ""
@@ -232,20 +248,27 @@ jobs:
           name: torrents
           path: dist/torrents
 
+      # 真实发送形态：正文 + 一个 .torrent 附件（zip 打包）。
       - name: 预览 QQ 消息
         run: |
           set -euo pipefail
-          BODY=$(cat dist/torrents/MAGNETS.txt | awk -F'\t' '{printf "- %s [磁力](%s)\n", $1, $3}')
+          ZIP=$(ls dist/torrents/*.zip | head -1)
+          COUNT=$(ls dist/torrents/*.torrent | wc -l)
+          FILES=$(ls dist/torrents/*.torrent | xargs -n1 basename | sed 's/\.torrent$//' | sed 's/^/- /')
+
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ### QQ 群消息预览
 
+          **附件**：\`$(basename "$ZIP")\` ($(stat -c%s "$ZIP") 字节，含 $COUNT 个种子)
+
           \`\`\`
-          ## WeQ $SOURCE_TAG 发布
+          ## WeQ ${SOURCE_TAG#v} 发布
 
-          全部产物已打包为磁力种子（内嵌 web seed，无需常驻做种）：
+          全部 $COUNT 个产物已打包为磁力种子，附件下载后解压，
+          用任意 BT 客户端打开 .torrent 即可（已内嵌 web seed，无需常驻做种）。
 
-          $BODY
+          $FILES
           \`\`\`
 
-          消息正文 ${#BODY} 字符
+          消息正文长度：$(printf '%s' "$FILES" | wc -c) 字符
           EOF
