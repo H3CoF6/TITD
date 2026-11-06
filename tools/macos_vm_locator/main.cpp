@@ -1,0 +1,549 @@
+// macOS QQ wrapper.node 的 sign / VM 定位与验证工具。
+//
+// 只支持 macOS 的 wrapper.node（universal 或 thin 的 Mach-O），可选 x86_64 / arm64。
+//
+// 它做三件事：
+//   1. 静态解析 Mach-O，取 `_libsecO3Sign`（sign core）的 RVA；
+//   2. 用 VM 分发器的魔数锚点定位分发器 RVA；
+//   3. dlopen wrapper.node，调用 sign core，验证输出 sign 为 28 字节。
+//
+// 构建：
+//   clang++ -std=c++17 -O2 -o macos_vm_locator main.cpp
+// 用法：
+//   ./macos_vm_locator /Applications/QQ.app/Contents/Resources/app/wrapper.node intel
+//   ./macos_vm_locator /Applications/QQ.app/Contents/Resources/app/wrapper.node arm
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kCpuX86_64 = CPU_TYPE_X86_64;
+constexpr uint32_t kCpuArm64 = CPU_TYPE_ARM64;
+
+template <typename T>
+T read_le(const uint8_t *p) {
+  T v;
+  std::memcpy(&v, p, sizeof(T));
+  return v;
+}
+
+uint32_t read_be32(const uint8_t *p) {
+  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) |
+         uint32_t(p[3]);
+}
+
+struct Range {
+  uint64_t vmaddr;
+  uint64_t vmsize;
+  uint64_t fileoff;
+  uint64_t filesize;
+};
+
+// 一个架构切片：文件字节 + 段表 + 符号表 + 解析结果。
+struct Slice {
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+  uint32_t cputype = 0;
+  std::vector<Range> segments;
+
+  // 符号名 -> n_value（虚拟地址）。
+  std::vector<std::pair<std::string, uint64_t>> symbols;
+
+  // 文件偏移 -> 虚拟地址（仅 __TEXT 等有 fileoff 的段）。
+  bool offset_to_addr(uint64_t off, uint64_t *out) const {
+    for (const Range &s : segments) {
+      if (off >= s.fileoff && off < s.fileoff + s.filesize) {
+        *out = s.vmaddr + (off - s.fileoff);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // 虚拟地址 -> 文件偏移。
+  bool addr_to_offset(uint64_t addr, uint64_t *out) const {
+    for (const Range &s : segments) {
+      if (addr >= s.vmaddr && addr < s.vmaddr + s.vmsize) {
+        uint64_t delta = addr - s.vmaddr;
+        if (delta < s.filesize) {
+          *out = s.fileoff + delta;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  const uint8_t *at(uint64_t addr, size_t len) const {
+    uint64_t off = 0;
+    if (!addr_to_offset(addr, &off) || off + len > size) return nullptr;
+    return data + off;
+  }
+};
+
+// 解析一个 thin Mach-O 切片的段表与符号表。
+bool parse_thin(const uint8_t *data, size_t size, Slice *slice, std::string *err) {
+  if (size < sizeof(mach_header_64)) {
+    *err = "文件太小，不是 64 位 Mach-O";
+    return false;
+  }
+  const auto *hdr = reinterpret_cast<const mach_header_64 *>(data);
+  if (hdr->magic != MH_MAGIC_64) {
+    *err = "不是 64 位 little-endian Mach-O";
+    return false;
+  }
+  slice->data = data;
+  slice->size = size;
+  slice->cputype = hdr->cputype;
+
+  const uint8_t *p = data + sizeof(mach_header_64);
+  const uint8_t *end = p + hdr->sizeofcmds;
+  if (hdr->sizeofcmds > size - sizeof(mach_header_64)) {
+    *err = "load command 表越界";
+    return false;
+  }
+
+  uint64_t symtab_off = 0, symtab_count = 0, strtab_off = 0, strtab_size = 0;
+  bool has_symtab = false;
+
+  for (uint32_t i = 0; i < hdr->ncmds && p + sizeof(load_command) <= end; ++i) {
+    const auto *lc = reinterpret_cast<const load_command *>(p);
+    if (lc->cmdsize < sizeof(load_command) || p + lc->cmdsize > end) {
+      *err = "load command 越界";
+      return false;
+    }
+    if (lc->cmd == LC_SEGMENT_64) {
+      const auto *seg = reinterpret_cast<const segment_command_64 *>(lc);
+      Range r{seg->vmaddr, seg->vmsize, seg->fileoff, seg->filesize};
+      slice->segments.push_back(r);
+    } else if (lc->cmd == LC_SYMTAB) {
+      const auto *st = reinterpret_cast<const symtab_command *>(lc);
+      symtab_off = st->symoff;
+      symtab_count = st->nsyms;
+      strtab_off = st->stroff;
+      strtab_size = st->strsize;
+      has_symtab = true;
+    }
+    p += lc->cmdsize;
+  }
+
+  if (!has_symtab || symtab_off + symtab_count * sizeof(nlist_64) > size ||
+      strtab_off + strtab_size > size) {
+    *err = "没有可用的符号表";
+    return false;
+  }
+
+  for (uint64_t i = 0; i < symtab_count; ++i) {
+    const auto *sym = reinterpret_cast<const nlist_64 *>(data + symtab_off + i * sizeof(nlist_64));
+    if (sym->n_un.n_strx == 0 || strtab_off + sym->n_un.n_strx >= size) continue;
+    const char *name = reinterpret_cast<const char *>(data + strtab_off + sym->n_un.n_strx);
+    size_t max_len = strtab_size - sym->n_un.n_strx;
+    size_t len = strnlen(name, max_len);
+    if (len == 0 || len == max_len) continue;
+    if (!(sym->n_type & N_STAB)) {
+      slice->symbols.emplace_back(std::string(name, len), sym->n_value);
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// VM 分发器定位
+// ---------------------------------------------------------------------------
+//
+// 分发器把两个加密指针分别与 0x23381121 / 0x23381120 做 XOR，然后交给
+// 字节码加载器算出真实 VM 入口。这两个魔数是保护层设计的一部分，跨版本稳定。
+//
+//   x86_64: 48 8d 0d <d32>   lea rcx,[rip+d]
+//           48 81 f1 21 11 38 23  xor rcx,0x23381121
+//           4c 8d 05 <d32>   lea r8,[rip+d]
+//           49 81 f0 20 11 38 23  xor r8,0x23381120
+//
+//   arm64:  52 82 24 0?   mov  w?,#0x1121
+//           72 a4 67 0?   movk w?,#0x2338,lsl#16
+//           52 82 24 0?   mov  w?,#0x1120
+//           72 a4 67 0?   movk w?,#0x2338,lsl#16
+//           ca 0? 01 0?   eor  x?,x?,x?
+
+// 在字节流里找 "lea rXX,[rip+disp32]"（48/4c 8d /r，modrm.rm=101）。
+bool is_lea_rip(const uint8_t *p, size_t avail, uint32_t *reg_out) {
+  if (avail < 7) return false;
+  if ((p[0] != 0x48 && p[0] != 0x4c) || p[1] != 0x8d) return false;
+  if ((p[2] & 0xc7) != 0x05) return false;
+  *reg_out = (p[2] >> 3) & 7;
+  return true;
+}
+
+// 找 "xor r64, imm32"（48/49 81 /6 id，modrm.reg=110）。
+bool is_xor_imm32(const uint8_t *p, size_t avail, uint32_t *reg_out, uint32_t *imm_out) {
+  if (avail < 7) return false;
+  if ((p[0] != 0x48 && p[0] != 0x49) || p[1] != 0x81) return false;
+  if (((p[2] >> 3) & 7) != 6) return false;
+  *reg_out = p[2] & 7;
+  *imm_out = read_le<uint32_t>(p + 3);
+  return true;
+}
+
+// x86_64：找 xor rcx,0x23381121 / xor r8,0x23381120 这对指令。
+bool find_dispatcher_x86(const Slice &s, uint64_t *rva_out) {
+  const uint8_t *d = s.data;
+  size_t n = s.size;
+  for (size_t i = 0; i + 7 <= n; ++i) {
+    uint32_t reg = 0, imm = 0;
+    if (!is_xor_imm32(d + i, n - i, &reg, &imm)) continue;
+    if (imm != 0x23381121) continue;
+    // 往前看是否紧邻一条 lea rcx,[rip+...]（4 字节对齐不强制）。
+    bool has_lea = false;
+    for (size_t back = 1; back <= 8 && i >= back; ++back) {
+      uint32_t lreg = 0;
+      if (is_lea_rip(d + i - back, 7, &lreg) && lreg == reg) {
+        has_lea = true;
+        break;
+      }
+    }
+    if (!has_lea) continue;
+    // 往后找 xor r8,0x23381120（同函数内，允许若干指令间隔）。
+    for (size_t j = i + 7; j + 7 <= n && j < i + 64; ++j) {
+      uint32_t reg2 = 0, imm2 = 0;
+      if (is_xor_imm32(d + j, n - j, &reg2, &imm2) && imm2 == 0x23381120) {
+        uint64_t addr = 0;
+        if (!s.offset_to_addr(i, &addr)) return false;
+        // 回退到函数起点：往前找最近的 push rbp; mov rbp,rsp（55 48 89 e5）。
+        uint64_t start = addr;
+        for (size_t k = i; k > 0 && k + 4 <= n; --k) {
+          if (d[k] == 0x55 && d[k + 1] == 0x48 && d[k + 2] == 0x89 && d[k + 3] == 0xe5) {
+            uint64_t a = 0;
+            if (s.offset_to_addr(k, &a)) start = a;
+            break;
+          }
+        }
+        *rva_out = start;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// arm64：找 "mov wX,#0x1121; movk wX,#0x2338,lsl#16"（0x23381121 的构造），
+// 再回退到函数起点（sub sp,sp,#N 或 stp x29,x30,...）。
+bool find_dispatcher_arm(const Slice &s, uint64_t *rva_out) {
+  const uint8_t *d = s.data;
+  size_t n = s.size;
+  for (size_t i = 0; i + 8 <= n; i += 4) {
+    uint32_t w0 = read_le<uint32_t>(d + i);
+    uint32_t w1 = read_le<uint32_t>(d + i + 4);
+    // mov w?, #0x1121 : 0x52800000 | (imm16<<5) | rd
+    if ((w0 & 0xFFE00000) != 0x52800000 || ((w0 >> 5) & 0xFFFF) != 0x1121) continue;
+    // movk w?, #0x2338, lsl #16 : 0x72A00000 | (hw<<21) | (imm16<<5) | rd
+    if ((w1 & 0xFFE00000) != 0x72A00000 || ((w1 >> 21) & 3) != 1 ||
+        ((w1 >> 5) & 0xFFFF) != 0x2338)
+      continue;
+    uint32_t rd = w0 & 0x1F;
+    if ((w1 & 0x1F) != rd) continue;
+    // 回退到函数起点：从魔数处往前找第一条 "sub sp,sp,#imm"（0xD10003FF 家族）。
+    // 找到它即函数入口；若先遇到 ret/b 则说明已越过边界，退回上一个候选。
+    uint64_t start = 0;
+    if (!s.offset_to_addr(i, &start)) return false;
+    bool found_start = false;
+    for (size_t k = i; k >= 4; k -= 4) {
+      uint32_t w = read_le<uint32_t>(d + k - 4);
+      // sub sp, sp, #imm：0xD10003FF 的 imm12 变体
+      if ((w & 0xFFC003FF) == 0xD10003FF) {
+        uint64_t a = 0;
+        if (s.offset_to_addr(k - 4, &a)) {
+          start = a;
+          found_start = true;
+        }
+        break;
+      }
+      // ret (0xD65F03C0) 或无条件 b（0x14000000 家族）：越过函数边界
+      if ((w & 0xFFFFFC1F) == 0xD65F0000 || (w & 0xFC000000) == 0x14000000) break;
+      if (k - 4 == 0) break;
+    }
+    if (!found_start) {
+      // 有些叶子函数没有 sub sp；退回到第一条 stp x29,x30 之后对齐的位置。
+      for (size_t k = i; k >= 4; k -= 4) {
+        uint32_t w = read_le<uint32_t>(d + k - 4);
+        if ((w & 0xFFC07FFF) == 0xA9807BFD || (w & 0xFFC07FFF) == 0xA9007BFD) {
+          uint64_t a = 0;
+          if (s.offset_to_addr(k - 4, &a)) start = a;
+          break;
+        }
+        if ((w & 0xFFFFFC1F) == 0xD65F0000 || (w & 0xFC000000) == 0x14000000) break;
+        if (k - 4 == 0) break;
+      }
+    }
+    *rva_out = start;
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// sign core
+// ---------------------------------------------------------------------------
+
+// 从符号表里取 _libsecO3Sign 的虚拟地址。
+bool find_sign_core(const Slice &s, uint64_t *rva_out) {
+  static const char *kNames[] = {"_libsecO3Sign", "libsecO3Sign"};
+  for (const auto &[name, value] : s.symbols) {
+    for (const char *want : kNames) {
+      if (name == want) {
+        *rva_out = value;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// 动态验证
+// ---------------------------------------------------------------------------
+
+// wrapper.node 引用了宿主提供的 qq_magic_napi_register；本工具导出同名桩并
+// 把自己提升为 RTLD_GLOBAL，让 dlopen 的 wrapper.node 能解析它。
+extern "C" void qq_magic_napi_register(void *) {}
+
+using SignFn = int (*)(const char *cmd, const uint8_t *src, size_t len, int seq, uint8_t *out);
+
+// 运行时 slide：wrapper.node 在 dyld 里的加载基址。
+uint64_t module_slide(const char *path);
+
+// 宿主进程的 CPU 类型（决定哪个切片能被 dlopen 执行）。
+uint32_t host_cpu_type();
+
+constexpr size_t kOutBuf = 0x400;
+constexpr size_t kSignLenOff = 0x2FF;
+constexpr size_t kSignDataOff = 0x200;
+
+bool load_and_sign(const char *path, uint64_t sign_rva, std::vector<uint8_t> *sign_out,
+                   std::string *err) {
+  // 提升自身为 RTLD_GLOBAL。
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void *>(&qq_magic_napi_register), &info) == 0 || !info.dli_fname) {
+    *err = "dladdr 失败，无法提升 RTLD_GLOBAL";
+    return false;
+  }
+  void *self = dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+  if (!self) {
+    *err = std::string("提升 RTLD_GLOBAL 失败: ") + dlerror();
+    return false;
+  }
+
+  void *lib = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+  if (!lib) {
+    *err = std::string("dlopen wrapper.node 失败: ") + dlerror();
+    return false;
+  }
+
+  uint64_t slide = module_slide(path);
+  if (slide == 0) {
+    *err = "dlopen 之后仍找不到 wrapper.node 的 dyld slide";
+    return false;
+  }
+
+  auto *fn = reinterpret_cast<SignFn>(slide + sign_rva);
+  std::vector<uint8_t> out(kOutBuf, 0);
+  const uint8_t payload[] = {0x08, 0x01};
+  const char *cmd = "trpc.qq_new_tech.status_svc.StatusService.SsoHeartBeat";
+  int ret = fn(cmd, payload, sizeof(payload), 1, out.data());
+
+  std::printf("dyld slide     : 0x%llx\n", (unsigned long long)slide);
+  std::printf("sign core addr : 0x%llx\n", (unsigned long long)(slide + sign_rva));
+
+  size_t sign_len = out[kSignLenOff];
+  if (sign_len == 0 || sign_len > 0x100) {
+    *err = "sign 长度为 0 或异常（ret=" + std::to_string(ret) + ", len=" + std::to_string(sign_len) + "）";
+    return false;
+  }
+  sign_out->assign(out.begin() + kSignDataOff, out.begin() + kSignDataOff + sign_len);
+  return true;
+}
+
+uint32_t host_cpu_type() {
+#if defined(__aarch64__)
+  return static_cast<uint32_t>(CPU_TYPE_ARM64);
+#elif defined(__x86_64__)
+  return static_cast<uint32_t>(CPU_TYPE_X86_64);
+#else
+  return 0;
+#endif
+}
+
+// 运行时 slide：wrapper.node 在 dyld 里的加载基址。
+//
+// dlopen 之后 dyld 记录的路径可能被规范化（解析符号链接、去掉 ./ 等），
+// 所以先按完整路径匹配，再退回到按文件名匹配。
+uint64_t module_slide(const char *path) {
+  uint32_t count = _dyld_image_count();
+  for (uint32_t i = 0; i < count; ++i) {
+    const char *name = _dyld_get_image_name(i);
+    if (name && std::strcmp(name, path) == 0) {
+      return static_cast<uint64_t>(_dyld_get_image_vmaddr_slide(i));
+    }
+  }
+  const char *base = std::strrchr(path, '/');
+  base = base ? base + 1 : path;
+  for (uint32_t i = 0; i < count; ++i) {
+    const char *name = _dyld_get_image_name(i);
+    if (!name) continue;
+    const char *nbase = std::strrchr(name, '/');
+    nbase = nbase ? nbase + 1 : name;
+    if (std::strcmp(nbase, base) == 0) {
+      return static_cast<uint64_t>(_dyld_get_image_vmaddr_slide(i));
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  if (argc < 3) {
+    std::fprintf(stderr,
+                 "用法: %s <wrapper.node> <intel|arm>\n"
+                 "  intel = x86_64 切片\n"
+                 "  arm   = arm64 切片\n",
+                 argv[0]);
+    return 2;
+  }
+  const char *path = argv[1];
+  std::string arch = argv[2];
+  uint32_t want_cpu = 0;
+  if (arch == "intel" || arch == "x86_64" || arch == "amd64") {
+    want_cpu = kCpuX86_64;
+  } else if (arch == "arm" || arch == "arm64" || arch == "aarch64") {
+    want_cpu = kCpuArm64;
+  } else {
+    std::fprintf(stderr, "未知架构: %s（用 intel 或 arm）\n", arch.c_str());
+    return 2;
+  }
+
+  // 读文件。
+  FILE *f = std::fopen(path, "rb");
+  if (!f) {
+    std::perror("open");
+    return 1;
+  }
+  std::fseek(f, 0, SEEK_END);
+  long fsize = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  std::vector<uint8_t> file(static_cast<size_t>(fsize));
+  if (std::fread(file.data(), 1, file.size(), f) != file.size()) {
+    std::fprintf(stderr, "读取文件失败\n");
+    std::fclose(f);
+    return 1;
+  }
+  std::fclose(f);
+
+  // 选切片。
+  Slice slice;
+  std::string err;
+  uint32_t magic = read_be32(file.data());
+  if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+    uint32_t nfat = read_be32(file.data() + 4);
+    bool found = false;
+    for (uint32_t i = 0; i < nfat; ++i) {
+      const uint8_t *fa = file.data() + 8 + i * sizeof(fat_arch);
+      if (8 + (i + 1) * sizeof(fat_arch) > file.size()) break;
+      uint32_t cputype = read_be32(fa);
+      uint32_t offset = read_be32(fa + 8);
+      uint32_t size = read_be32(fa + 12);
+      if (cputype != want_cpu) continue;
+      if (offset + size > file.size()) {
+        err = "切片越界";
+        break;
+      }
+      if (!parse_thin(file.data() + offset, size, &slice, &err)) break;
+      found = true;
+      break;
+    }
+    if (!found) {
+      std::fprintf(stderr, "fat 文件里没有 %s 切片（%s）\n", arch.c_str(), err.c_str());
+      return 1;
+    }
+  } else {
+    if (!parse_thin(file.data(), file.size(), &slice, &err)) {
+      std::fprintf(stderr, "解析 Mach-O 失败: %s\n", err.c_str());
+      return 1;
+    }
+    if (slice.cputype != want_cpu) {
+      std::fprintf(stderr, "文件架构不匹配（文件是 %s，要求 %s）\n",
+                   slice.cputype == kCpuX86_64 ? "x86_64" : "其他", arch.c_str());
+      return 1;
+    }
+  }
+
+  std::printf("== wrapper.node (%s) ==\n", arch.c_str());
+  std::printf("cputype        : 0x%x\n", slice.cputype);
+  std::printf("segments       : %zu\n", slice.segments.size());
+  std::printf("symbols        : %zu\n", slice.symbols.size());
+
+  // 1) sign core
+  uint64_t sign_rva = 0;
+  if (!find_sign_core(slice, &sign_rva)) {
+    std::fprintf(stderr, "符号表里找不到 _libsecO3Sign\n");
+    return 1;
+  }
+  std::printf("sign core RVA  : 0x%llx  (_libsecO3Sign)\n", (unsigned long long)sign_rva);
+
+  // 2) VM 分发器
+  uint64_t dispatcher_rva = 0;
+  bool ok = slice.cputype == kCpuX86_64 ? find_dispatcher_x86(slice, &dispatcher_rva)
+                                        : find_dispatcher_arm(slice, &dispatcher_rva);
+  if (!ok) {
+    std::fprintf(stderr, "未定位到 VM 分发器（魔数 0x23381121/0x23381120 未命中）\n");
+    return 1;
+  }
+  std::printf("VM dispatcher  : 0x%llx  (RVA)\n", (unsigned long long)dispatcher_rva);
+
+  // 3) 动态验证（dlopen 之后才能取到 slide）。
+  // 只能验证宿主同架构的切片；在 x86_64 机器上选 arm 切片时跳过。
+  if (slice.cputype != static_cast<uint32_t>(CPU_TYPE_X86_64) &&
+      slice.cputype != static_cast<uint32_t>(CPU_TYPE_ARM64)) {
+    std::fprintf(stderr, "未知 cputype，跳过动态验证\n");
+    return 1;
+  }
+  if (slice.cputype != host_cpu_type()) {
+    std::printf("动态验证     : 跳过（宿主是 %s，目标切片是 %s）\n",
+                host_cpu_type() == static_cast<uint32_t>(CPU_TYPE_X86_64) ? "x86_64" : "arm64",
+                slice.cputype == static_cast<uint32_t>(CPU_TYPE_X86_64) ? "x86_64" : "arm64");
+    std::printf("OK: 静态定位完成\n");
+    return 0;
+  }
+
+  std::vector<uint8_t> sign;
+  if (!load_and_sign(path, sign_rva, &sign, &err)) {
+    std::fprintf(stderr, "签名验证失败: %s\n", err.c_str());
+    return 1;
+  }
+
+  std::printf("sign length    : %zu 字节\n", sign.size());
+  std::printf("sign           : ");
+  for (uint8_t b : sign) std::printf("%02X", b);
+  std::printf("\n");
+
+  if (sign.size() != 28) {
+    std::fprintf(stderr, "FAIL: 期望 28 字节，实际 %zu\n", sign.size());
+    return 1;
+  }
+  std::printf("OK: sign 为 28 字节\n");
+  return 0;
+}

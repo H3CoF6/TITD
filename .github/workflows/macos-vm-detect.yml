@@ -1,0 +1,157 @@
+name: macOS VM detect
+
+# 手动触发。每个 QQ macOS 版本 × 每个架构各跑一个 job，互相独立并发。
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: '逗号分隔的版本过滤（留空 = 全部）'
+        required: false
+        default: ''
+
+jobs:
+  # 生成 matrix：版本 × 架构
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        env:
+          FILTER: ${{ inputs.versions }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+
+          # 版本 -> dmg 下载地址（来自 downloads.json 整理）
+          CATALOG = {
+              "7.0.2.53644": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/837fcb63/QQ_v7.0.2.53644.dmg",
+              "7.0.2.53489": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/5947d5d1/QQ_v7.0.2.53489.dmg",
+              "7.0.1.52892": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.35/beta/110ab2aa/QQ_v7.0.1.52892.dmg",
+              "7.0.1.52804": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.35/beta/2e3af37e/QQ_v7.0.1.52804.dmg",
+              "7.0.0.52194": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/126b7ce6/QQ_v7.0.0.52194.dmg",
+              "7.0.0.52074": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/95242b5b/QQ_v7.0.0.52074.dmg",
+              "6.9.99.51802": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/57c59cd0/QQ_v6.9.99.51802.dmg",
+              "6.9.99.51728": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/cba20986/QQ_v6.9.99.51728.dmg",
+              "6.9.99.51552": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/834b04f9/QQ_v6.9.99.51552.dmg",
+              "6.9.98.50969": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/beta/97487280/QQ_v6.9.98.50969.dmg",
+              "6.9.97.50828": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/beta/d2910fe0/QQ_v6.9.97.50828.dmg",
+              "6.9.97.50776": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/beta/4c16ad77/QQ_v6.9.97.50776.dmg",
+              "6.9.96.49738": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.31/beta/045f4292/QQ_v6.9.96.49738.dmg",
+              "6.9.96.49599": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.31/beta/6d42370f/QQ_v6.9.96.49599.dmg",
+          }
+
+          filt = [v.strip() for v in os.environ.get("FILTER", "").split(",") if v.strip()]
+          versions = [v for v in CATALOG if not filt or any(f in v for f in filt)]
+
+          # intel 跑在 macos-13（x86_64），arm 跑在 macos-14（arm64），
+          # 这样两个架构都能做动态签名验证。
+          runners = {"intel": "macos-13", "arm": "macos-14"}
+          include = []
+          for v in versions:
+              for arch, runner in runners.items():
+                  include.append({
+                      "version": v,
+                      "arch": arch,
+                      "runner": runner,
+                      "url": CATALOG[v],
+                  })
+
+          matrix = json.dumps({"include": include})
+          print(matrix)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + matrix + "\n")
+          PY
+
+  detect:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.version }} / ${{ matrix.arch }}
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          echo "runner : ${{ matrix.runner }}"
+          echo "arch   : $(uname -m)"
+          sw_vers
+
+      - name: 构建定位工具
+        working-directory: tools/macos_vm_locator
+        run: |
+          make
+          ./macos_vm_locator 2>&1 | head -5 || true
+
+      - name: 下载 dmg
+        env:
+          URL: ${{ matrix.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/qq"
+          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/qq/qq.dmg" "$URL"
+          ls -lh "$RUNNER_TEMP/qq/qq.dmg"
+          file "$RUNNER_TEMP/qq/qq.dmg"
+
+      - name: 解包并定位
+        id: locate
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          cd tools/macos_vm_locator
+
+          echo "=== 提取 wrapper.node ==="
+          WRAPPER="$(./extract_wrapper.sh "$RUNNER_TEMP/qq/qq.dmg" "$RUNNER_TEMP/qq/wrapper.node" 2>"$RUNNER_TEMP/qq/extract.log")"
+          cat "$RUNNER_TEMP/qq/extract.log"
+          echo "wrapper = $WRAPPER"
+          ls -lh "$WRAPPER"
+          file "$WRAPPER"
+
+          echo
+          echo "=== 定位 + 验证 ($ARCH) ==="
+          set +e
+          ./macos_vm_locator "$WRAPPER" "$ARCH" 2>&1 | tee "$RUNNER_TEMP/qq/result.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit=$rc"
+          {
+            echo "### $VERSION / $ARCH"
+            echo '```'
+            cat "$RUNNER_TEMP/qq/result.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::定位/验证未完全通过（exit=$rc），见上方输出"
+          fi
+
+      - name: 汇总到 artifact
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/qq/result.txt" "$RUNNER_TEMP/out/${{ matrix.version }}-${{ matrix.arch }}.txt" 2>/dev/null || true
+          cp "$RUNNER_TEMP/qq/extract.log" "$RUNNER_TEMP/out/${{ matrix.version }}-${{ matrix.arch }}-extract.log" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.version }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 清理挂载
+        if: always()
+        run: |
+          mount | grep -i "QQ.app" || true
+          hdiutil detach "$RUNNER_TEMP"/qq/mnt 2>/dev/null || true
+          for m in $(mount | grep -o '/var/folders[^ ]*mnt' || true); do
+            hdiutil detach "$m" 2>/dev/null || true
+          done
