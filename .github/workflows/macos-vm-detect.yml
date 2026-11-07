@@ -12,6 +12,10 @@ on:
         description: '只跑某个架构（intel / arm / 留空 = 两个都跑）'
         required: false
         default: ''
+      repeat:
+        description: '每个 job 连续调用 sign core 的次数（默认 1）'
+        required: false
+        default: "1"
   # 非默认分支上的 workflow_dispatch 不会出现在手动触发列表里，
   # 所以再挂一个 push 触发，推到本分支就自动跑。
   push:
@@ -130,6 +134,8 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ matrix.version }}
+          REPEAT: ${{ inputs.repeat || '1' }}
+          COMMIT_MSG2: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
           cd tools/macos_vm_locator
@@ -159,7 +165,13 @@ jobs:
           echo
           echo "=== 定位 + 验证 ($ARCH) ==="
           set +e
-          ./macos_vm_locator "$WRAPPER" "$ARCH" > "$RUNNER_TEMP/qq/result.txt" 2>&1
+          rep="${REPEAT:-1}"
+          if [ "$rep" = "1" ]; then
+            m=$(printf '%s' "${COMMIT_MSG2:-}" | grep -o 'run-repeat:[[:space:]]*[0-9]*' || true)
+            if [ -n "$m" ]; then rep=$(printf '%s' "$m" | grep -o '[0-9]*'); fi
+          fi
+          echo "repeat=$rep"
+          ./macos_vm_locator "$WRAPPER" "$ARCH" --repeat "$rep" > "$RUNNER_TEMP/qq/result.txt" 2>&1
           rc=$?
           cat "$RUNNER_TEMP/qq/result.txt"
           set -e

@@ -25,6 +25,8 @@
 #include <unistd.h>
 
 #include <execinfo.h>
+
+#include <sys/wait.h>
 #include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
@@ -420,8 +422,9 @@ void crash_handler(int sig) {
   _exit(128 + sig);
 }
 
-bool load_and_sign(const char *path, uint64_t sign_rva, std::vector<uint8_t> *sign_out,
-                   std::string *err) {
+// dlopen wrapper.node 并返回 sign core 的地址；失败时 err 里带原因。
+bool open_library(const char *path, uint64_t sign_rva, void **fn_out, uint64_t *slide_out,
+                  std::string *err) {
   // 提升自身为 RTLD_GLOBAL。
   Dl_info info{};
   if (dladdr(reinterpret_cast<void *>(&qq_magic_napi_register), &info) == 0 || !info.dli_fname) {
@@ -458,28 +461,82 @@ bool load_and_sign(const char *path, uint64_t sign_rva, std::vector<uint8_t> *si
     return false;
   }
 
-  auto *fn = reinterpret_cast<SignFn>(slide + sign_rva);
+  *slide_out = slide;
+  *fn_out = reinterpret_cast<void *>(slide + sign_rva);
+  return true;
+}
+
+// 调一次 sign core。返回 0 表示成功，否则是 errno 风格的错误码。
+// 崩溃时由 crash_handler 打印栈并 _exit，不会返回。
+int call_sign(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
+  auto *fn = reinterpret_cast<SignFn>(fn_ptr);
   std::vector<uint8_t> out(kOutBuf, 0);
   const uint8_t payload[] = {0x08, 0x01};
   const char *cmd = "trpc.qq_new_tech.status_svc.StatusService.SsoHeartBeat";
+
   std::signal(SIGSEGV, crash_handler);
   std::signal(SIGBUS, crash_handler);
   std::signal(SIGILL, crash_handler);
   std::signal(SIGABRT, crash_handler);
   g_in_sign_call = 1;
-  int ret = fn(cmd, payload, sizeof(payload), 1, out.data());
+  int ret = fn(cmd, payload, sizeof(payload), seq, out.data());
   g_in_sign_call = 0;
-
-  std::printf("dyld slide     : 0x%llx\n", (unsigned long long)slide);
-  std::printf("sign core addr : 0x%llx\n", (unsigned long long)(slide + sign_rva));
 
   size_t sign_len = out[kSignLenOff];
   if (sign_len == 0 || sign_len > 0x100) {
-    *err = "sign 长度为 0 或异常（ret=" + std::to_string(ret) + ", len=" + std::to_string(sign_len) + "）";
-    return false;
+    return (ret != 0) ? ret : -1;
   }
   sign_out->assign(out.begin() + kSignDataOff, out.begin() + kSignDataOff + sign_len);
-  return true;
+  return 0;
+}
+
+// 在子进程里调一次，父进程通过退出码/管道收集结果。
+// 返回：0=成功；>0=sign core 返回的错误；128+sig=信号崩溃；-1=子进程异常。
+int call_in_child(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
+  int fds[2];
+  if (pipe(fds) != 0) return -1;
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    // 子进程：关闭读端，结果打包成 [len][bytes] 写回。
+    close(fds[0]);
+    std::vector<uint8_t> sign;
+    int rc = call_sign(fn_ptr, seq, &sign);
+    if (rc == 0) {
+      uint8_t len = (uint8_t)sign.size();
+      (void)!write(fds[1], &len, 1);
+      (void)!write(fds[1], sign.data(), sign.size());
+      _exit(0);
+    }
+    _exit(rc > 0 ? (rc & 0x7f) : 0);  // 退出码只有低 8 位
+  }
+
+  close(fds[1]);
+  uint8_t len = 0;
+  ssize_t got = read(fds[0], &len, 1);
+  if (got == 1 && len > 0 && len <= 64) {
+    sign_out->resize(len);
+    size_t off = 0;
+    while (off < len) {
+      ssize_t n = read(fds[0], sign_out->data() + off, len - off);
+      if (n <= 0) break;
+      off += (size_t)n;
+    }
+    if (off != len) sign_out->clear();
+  }
+  close(fds[0]);
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  return -1;
 }
 
 uint32_t host_cpu_type() {
@@ -523,14 +580,24 @@ uint64_t module_slide(const char *path) {
 int main(int argc, char **argv) {
   if (argc < 3) {
     std::fprintf(stderr,
-                 "用法: %s <wrapper.node> <intel|arm>\n"
-                 "  intel = x86_64 切片\n"
-                 "  arm   = arm64 切片\n",
+                 "用法: %s <wrapper.node> <intel|arm> [--repeat N]\n"
+                 "  intel      = x86_64 切片\n"
+                 "  arm        = arm64 切片\n"
+                 "  --repeat N = 连续调用 N 次 sign core（每次 fork 子进程，\n"
+                 "               崩溃不影响后续轮次），统计稳定性\n",
                  argv[0]);
     return 2;
   }
   const char *path = argv[1];
   std::string arch = argv[2];
+  int repeat = 0;
+  for (int i = 3; i + 1 < argc; ++i) {
+    if (std::strcmp(argv[i], "--repeat") == 0) {
+      repeat = std::atoi(argv[i + 1]);
+      if (repeat < 0) repeat = 0;
+      ++i;
+    }
+  }
   uint32_t want_cpu = 0;
   if (arch == "intel" || arch == "x86_64" || arch == "amd64") {
     want_cpu = kCpuX86_64;
@@ -634,21 +701,60 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  std::vector<uint8_t> sign;
-  if (!load_and_sign(path, sign_rva, &sign, &err)) {
-    std::fprintf(stderr, "签名验证失败: %s\n", err.c_str());
+  void *fn_ptr = nullptr;
+  uint64_t slide = 0;
+  if (!open_library(path, sign_rva, &fn_ptr, &slide, &err)) {
+    std::fprintf(stderr, "加载失败: %s\n", err.c_str());
     return 1;
   }
+  std::printf("dyld slide     : 0x%llx\n", (unsigned long long)slide);
+  std::printf("sign core addr : 0x%llx\n", (unsigned long long)(slide + sign_rva));
 
-  std::printf("sign length    : %zu 字节\n", sign.size());
-  std::printf("sign           : ");
-  for (uint8_t b : sign) std::printf("%02X", b);
-  std::printf("\n");
+  // 单次：直接在子进程里跑，崩溃也能拿到栈。
+  int rounds = repeat > 0 ? repeat : 1;
+  int n_ok = 0, n_crash = 0, n_err = 0;
+  std::vector<uint8_t> first_sign;
 
-  if (sign.size() != 28) {
-    std::fprintf(stderr, "FAIL: 期望 28 字节，实际 %zu\n", sign.size());
+  for (int i = 0; i < rounds; ++i) {
+    std::vector<uint8_t> sign;
+    std::printf("call %d/%d ... ", i + 1, rounds);
+    std::fflush(stdout);
+
+    int rc = call_in_child(fn_ptr, i + 1, &sign);
+    if (rc == 0 && sign.size() == 28) {
+      ++n_ok;
+      std::printf("ok  %s\n", [&] {
+        static char buf[128];
+        int n = 0;
+        for (uint8_t b : sign) n += std::snprintf(buf + n, sizeof(buf) - n, "%02X", b);
+        return std::string(buf, (size_t)n);
+      }().c_str());
+      if (first_sign.empty()) first_sign = sign;
+    } else if (rc >= 128) {
+      ++n_crash;
+      std::printf("CRASH signal=%s (exit=%d)\n", signal_name(rc - 128), rc);
+    } else {
+      ++n_err;
+      std::printf("ERROR rc=%d len=%zu\n", rc, sign.size());
+    }
+    std::fflush(stdout);
+  }
+
+  std::printf("\n结果: 成功 %d / 崩溃 %d / 错误 %d（共 %d 次）\n", n_ok, n_crash, n_err, rounds);
+  if (!first_sign.empty()) {
+    std::printf("sign           : ");
+    for (uint8_t b : first_sign) std::printf("%02X", b);
+    std::printf("\n");
+  }
+
+  if (n_ok == 0) {
+    std::fprintf(stderr, "FAIL: 没有一次成功\n");
     return 1;
   }
-  std::printf("OK: sign 为 28 字节\n");
+  if (n_crash > 0 || n_err > 0) {
+    std::fprintf(stderr, "PARTIAL: 有 %d 次崩溃 / %d 次错误\n", n_crash, n_err);
+    return 1;
+  }
+  std::printf("OK: %d 次调用全部成功，sign 28 字节\n", n_ok);
   return 0;
 }
