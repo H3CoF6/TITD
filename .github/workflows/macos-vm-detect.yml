@@ -13,7 +13,7 @@ on:
         required: false
         default: ''
       repeat:
-        description: '每个 job 连续调用 sign core 的次数（默认 1）'
+        description: '每个 job 对 VM 与 sign core 各连续调用的次数（默认 1）'
         required: false
         default: "1"
   # 非默认分支上的 workflow_dispatch 不会出现在手动触发列表里，
@@ -171,20 +171,23 @@ jobs:
             if [ -n "$m" ]; then rep=$(printf '%s' "$m" | grep -o '[0-9]*'); fi
           fi
           echo "repeat=$rep"
-          ./macos_vm_locator "$WRAPPER" "$ARCH" --repeat "$rep" > "$RUNNER_TEMP/qq/result.txt" 2>&1
+
+          # 默认同时验证 VM 分发器与 sign core：只有这两条都真正执行成功，
+          # 才能说明这个版本可用。以前只调 sign core，VM 从未被执行过。
+          ./macos_vm_locator "$WRAPPER" "$ARCH" --repeat "$rep" --target both \
+            > "$RUNNER_TEMP/qq/result.txt" 2>&1
           rc=$?
           cat "$RUNNER_TEMP/qq/result.txt"
           set -e
 
           echo "exit=$rc"
 
-          # 动态调用在某些版本的 arm64 切片上会崩（依赖未初始化等）。
-          # 静态定位已经完成，记为 warning 而不是 error，避免整个 job 判红。
+          # 这里是真实验证：任何崩溃或错误都判红，不再降级成 warning。
           if [ "$rc" -ge 128 ]; then
             sig=$(kill -l $((rc-128)) 2>/dev/null || echo signal)
-            echo "::warning::动态验证被 $sig 终止（exit=$rc），静态定位结果仍然有效"
+            echo "::error::验证被 $sig 终止（exit=$rc）"
           elif [ "$rc" -ne 0 ]; then
-            echo "::warning::定位/验证未完全通过（exit=$rc）"
+            echo "::error::VM / sign core 验证未通过（exit=$rc）"
           fi
           {
             echo "### $VERSION / $ARCH"

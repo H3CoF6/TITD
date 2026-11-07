@@ -329,6 +329,25 @@ extern "C" void qq_magic_napi_register(void *) {}
 
 using SignFn = int (*)(const char *cmd, const uint8_t *src, size_t len, int seq, uint8_t *out);
 
+// macOS 的 libc++ `std::string`（old ABI）：`{ cap_and_flag; size; ptr }`。
+// 低位 1 表示长串，`cap = cap_and_flag >> 1`。
+struct LcxxString {
+  size_t cap_and_flag;
+  size_t size;
+  char *ptr;
+};
+static_assert(sizeof(LcxxString) == 24, "libc++ string is 24 bytes");
+
+// VM 分发器的真实签名（lldb 实测，x86_64 / 7.0.0）：
+//   vm(out, b1, b2, cmd, mode, ctx)
+// 五个参数都是 std::string*，`mode` 是 int（实测 3）。
+// `out` 由调用方提供并被原地写入；`ctx` 必须是合法 string（可为空），
+// 分发器会直接解引用它，传 NULL 会 SIGSEGV。
+using VmFn = void (*)(LcxxString *, const LcxxString *, const LcxxString *, const LcxxString *,
+                      int, const LcxxString *);
+
+constexpr int kMacVmMode = 3;
+
 // 运行时 slide：wrapper.node 在 dyld 里的加载基址。
 uint64_t module_slide(const char *path);
 
@@ -342,6 +361,9 @@ constexpr size_t kSignDataOff = 0x200;
 // 调用 sign core 时若崩溃（arm64 上可能因为缺少初始化或依赖），
 // 捕获信号后打印诊断并退出，避免日志里只剩一个“段错误”。
 volatile sig_atomic_t g_in_sign_call = 0;
+
+// 本次运行验证的是 VM 还是 sign core（决定子进程调哪个）。
+bool g_use_vm = false;
 
 const char *signal_name(int sig) {
   switch (sig) {
@@ -490,6 +512,55 @@ int call_sign(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
   return 0;
 }
 
+// 构造 libc++ 长串：内容拷进 `storage`，返回指向它的描述符。
+// 一律用长串，避免 SSO 的自引用结构——VM 只读 size/ptr。
+LcxxString make_lcxx(std::vector<char> *storage, const void *data, size_t len) {
+  storage->assign(static_cast<const char *>(data), static_cast<const char *>(data) + len);
+  storage->push_back('\0');
+  LcxxString s{};
+  s.cap_and_flag = (len << 1) | 1;
+  s.size = len;
+  s.ptr = storage->data();
+  return s;
+}
+
+// 调一次 VM 分发器。与 `call_sign` 的区别：不经过 sign core，自己算 md5
+// 后直接喂给 VM，因此不依赖 wrapper 内的会话单例。
+// 崩溃时由 crash_handler 打印栈并 _exit，不会返回。
+int call_vm(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
+  auto *fn = reinterpret_cast<VmFn>(fn_ptr);
+  const char *cmd = "trpc.qq_new_tech.status_svc.StatusService.SsoHeartBeat";
+
+  // 与 sign core 路径相同的输入：空 token/extra → payload `\x08\x01` 的 MD5。
+  // 这里直接喂那个实测常量，也可以用 md5 库；seq 只影响 sign core 的分支，
+  // VM 只看 md5。
+  (void)seq;
+  static const uint8_t kMd5[16] = {0xF7, 0xC5, 0x7F, 0x06, 0xA1, 0xD3, 0xCE, 0x11,
+                                   0x77, 0x49, 0xFC, 0x98, 0xE2, 0x11, 0x16, 0x68};
+
+  std::vector<char> cmd_buf, md5_buf, empty_buf, ctx_buf;
+  LcxxString s_cmd = make_lcxx(&cmd_buf, cmd, std::strlen(cmd));
+  LcxxString s_md5 = make_lcxx(&md5_buf, kMd5, sizeof(kMd5));
+  LcxxString s_empty = make_lcxx(&empty_buf, "", 0);
+  LcxxString s_ctx = make_lcxx(&ctx_buf, "", 0);  // 不能是 NULL
+  LcxxString out{};
+
+  std::signal(SIGSEGV, crash_handler);
+  std::signal(SIGBUS, crash_handler);
+  std::signal(SIGILL, crash_handler);
+  std::signal(SIGABRT, crash_handler);
+  g_in_sign_call = 1;
+  fn(&out, &s_md5, &s_empty, &s_cmd, kMacVmMode, &s_ctx);
+  g_in_sign_call = 0;
+
+  if (out.size == 0 || out.size > 0x100 || !out.ptr) {
+    return -1;
+  }
+  sign_out->assign(reinterpret_cast<uint8_t *>(out.ptr),
+                   reinterpret_cast<uint8_t *>(out.ptr) + out.size);
+  return 0;
+}
+
 // 在子进程里调一次，父进程通过退出码/管道收集结果。
 // 返回：0=成功；>0=sign core 返回的错误；128+sig=信号崩溃；-1=子进程异常。
 int call_in_child(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
@@ -507,7 +578,7 @@ int call_in_child(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
     // 子进程：关闭读端，结果打包成 [len][bytes] 写回。
     close(fds[0]);
     std::vector<uint8_t> sign;
-    int rc = call_sign(fn_ptr, seq, &sign);
+    int rc = g_use_vm ? call_vm(fn_ptr, seq, &sign) : call_sign(fn_ptr, seq, &sign);
     if (rc == 0) {
       uint8_t len = (uint8_t)sign.size();
       (void)!write(fds[1], &len, 1);
@@ -520,6 +591,7 @@ int call_in_child(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
   close(fds[1]);
   uint8_t len = 0;
   ssize_t got = read(fds[0], &len, 1);
+  (void)got;
   if (got == 1 && len > 0 && len <= 64) {
     sign_out->resize(len);
     size_t off = 0;
@@ -580,24 +652,32 @@ uint64_t module_slide(const char *path) {
 int main(int argc, char **argv) {
   if (argc < 3) {
     std::fprintf(stderr,
-                 "用法: %s <wrapper.node> <intel|arm> [--repeat N]\n"
+                 "用法: %s <wrapper.node> <intel|arm> [--repeat N] [--target vm|sign|both]\n"
                  "  intel      = x86_64 切片\n"
                  "  arm        = arm64 切片\n"
-                 "  --repeat N = 连续调用 N 次 sign core（每次 fork 子进程，\n"
-                 "               崩溃不影响后续轮次），统计稳定性\n",
+                 "  --repeat N = 连续调用 N 次（每次 fork 子进程，崩溃不影响后续轮次）\n"
+                 "               VM 与 sign core 各调 N 次\n"
+                 "  --target   = vm: 只验证 VM 分发器；sign: 只验证 sign core；\n"
+                 "               both（默认）: 两者都验证并对比输出\n",
                  argv[0]);
     return 2;
   }
   const char *path = argv[1];
   std::string arch = argv[2];
   int repeat = 0;
+  std::string target = "both";
   for (int i = 3; i + 1 < argc; ++i) {
     if (std::strcmp(argv[i], "--repeat") == 0) {
       repeat = std::atoi(argv[i + 1]);
       if (repeat < 0) repeat = 0;
       ++i;
+    } else if (std::strcmp(argv[i], "--target") == 0) {
+      target = argv[i + 1];
+      ++i;
     }
   }
+  bool want_vm = (target == "vm" || target == "both");
+  bool want_sign = (target == "sign" || target == "both");
   uint32_t want_cpu = 0;
   if (arch == "intel" || arch == "x86_64" || arch == "amd64") {
     want_cpu = kCpuX86_64;
@@ -701,60 +781,87 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  void *fn_ptr = nullptr;
+  // 先 dlopen，再分别解析 VM 分发器与 sign core 的运行时地址。
   uint64_t slide = 0;
-  if (!open_library(path, sign_rva, &fn_ptr, &slide, &err)) {
-    std::fprintf(stderr, "加载失败: %s\n", err.c_str());
-    return 1;
+  {
+    // open_library 顺带完成 RTLD_GLOBAL 提升；这里只是拿 slide。
+    void *dummy = nullptr;
+    if (!open_library(path, sign_rva, &dummy, &slide, &err)) {
+      std::fprintf(stderr, "加载失败: %s\n", err.c_str());
+      return 1;
+    }
   }
   std::printf("dyld slide     : 0x%llx\n", (unsigned long long)slide);
   std::printf("sign core addr : 0x%llx\n", (unsigned long long)(slide + sign_rva));
+  std::printf("vm dispatcher  : 0x%llx  (addr)\n", (unsigned long long)(slide + dispatcher_rva));
 
-  // 单次：直接在子进程里跑，崩溃也能拿到栈。
   int rounds = repeat > 0 ? repeat : 1;
-  int n_ok = 0, n_crash = 0, n_err = 0;
-  std::vector<uint8_t> first_sign;
+  int total_crash = 0, total_err = 0;
+  bool any_ok = false;
 
-  for (int i = 0; i < rounds; ++i) {
-    std::vector<uint8_t> sign;
-    std::printf("call %d/%d ... ", i + 1, rounds);
-    std::fflush(stdout);
+  // 逐个目标跑：VM 与 sign core 各 N 次。
+  struct Plan {
+    const char *name;
+    bool use_vm;
+    void *fn;
+    size_t want_len;
+  } plans[2] = {
+      {"vm", true, reinterpret_cast<void *>(slide + dispatcher_rva), 28},
+      {"sign", false, reinterpret_cast<void *>(slide + sign_rva), 28},
+  };
 
-    int rc = call_in_child(fn_ptr, i + 1, &sign);
-    if (rc == 0 && sign.size() == 28) {
-      ++n_ok;
-      std::printf("ok  %s\n", [&] {
-        static char buf[128];
-        int n = 0;
-        for (uint8_t b : sign) n += std::snprintf(buf + n, sizeof(buf) - n, "%02X", b);
-        return std::string(buf, (size_t)n);
-      }().c_str());
-      if (first_sign.empty()) first_sign = sign;
-    } else if (rc >= 128) {
-      ++n_crash;
-      std::printf("CRASH signal=%s (exit=%d)\n", signal_name(rc - 128), rc);
-    } else {
-      ++n_err;
-      std::printf("ERROR rc=%d len=%zu\n", rc, sign.size());
+  for (const Plan &p : plans) {
+    if (p.use_vm ? !want_vm : !want_sign) continue;
+    std::printf("\n=== 验证目标: %s ===\n", p.name);
+    g_use_vm = p.use_vm;
+    int n_ok = 0, n_crash = 0, n_err = 0;
+    std::vector<uint8_t> first_sign;
+
+    for (int i = 0; i < rounds; ++i) {
+      std::vector<uint8_t> sign;
+      std::printf("call %d/%d ... ", i + 1, rounds);
+      std::fflush(stdout);
+
+      int rc = call_in_child(p.fn, i + 1, &sign);
+      if (rc == 0 && sign.size() == p.want_len) {
+        ++n_ok;
+        std::printf("ok  %s\n", [&] {
+          static char buf[128];
+          int n = 0;
+          for (uint8_t b : sign) n += std::snprintf(buf + n, sizeof(buf) - n, "%02X", b);
+          return std::string(buf, (size_t)n);
+        }().c_str());
+        if (first_sign.empty()) first_sign = sign;
+      } else if (rc >= 128) {
+        ++n_crash;
+        std::printf("CRASH signal=%s (exit=%d)\n", signal_name(rc - 128), rc);
+      } else {
+        ++n_err;
+        std::printf("ERROR rc=%d len=%zu\n", rc, sign.size());
+      }
+      std::fflush(stdout);
     }
-    std::fflush(stdout);
+
+    std::printf("结果[%s]: 成功 %d / 崩溃 %d / 错误 %d（共 %d 次）\n", p.name, n_ok, n_crash, n_err,
+                rounds);
+    if (!first_sign.empty()) {
+      std::printf("sign[%s]      : ", p.name);
+      for (uint8_t b : first_sign) std::printf("%02X", b);
+      std::printf("\n");
+    }
+    if (n_ok > 0) any_ok = true;
+    total_crash += n_crash;
+    total_err += n_err;
   }
 
-  std::printf("\n结果: 成功 %d / 崩溃 %d / 错误 %d（共 %d 次）\n", n_ok, n_crash, n_err, rounds);
-  if (!first_sign.empty()) {
-    std::printf("sign           : ");
-    for (uint8_t b : first_sign) std::printf("%02X", b);
-    std::printf("\n");
-  }
-
-  if (n_ok == 0) {
+  if (!any_ok) {
     std::fprintf(stderr, "FAIL: 没有一次成功\n");
     return 1;
   }
-  if (n_crash > 0 || n_err > 0) {
-    std::fprintf(stderr, "PARTIAL: 有 %d 次崩溃 / %d 次错误\n", n_crash, n_err);
+  if (total_crash > 0 || total_err > 0) {
+    std::fprintf(stderr, "PARTIAL: 有 %d 次崩溃 / %d 次错误\n", total_crash, total_err);
     return 1;
   }
-  std::printf("OK: %d 次调用全部成功，sign 28 字节\n", n_ok);
+  std::printf("\nOK: 所有目标 %d 次调用全部成功，sign 28 字节\n", rounds);
   return 0;
 }
