@@ -23,6 +23,8 @@
 #include <csignal>
 #include <dlfcn.h>
 #include <unistd.h>
+
+#include <execinfo.h>
 #include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
@@ -349,14 +351,71 @@ const char *signal_name(int sig) {
   }
 }
 
+// async-signal-safe 的十六进制输出。
+void write_hex(uintptr_t v) {
+  char buf[2 + sizeof(uintptr_t) * 2];
+  buf[0] = '0';
+  buf[1] = 'x';
+  int n = 2;
+  for (int shift = (int)(sizeof(uintptr_t) * 8) - 4; shift >= 0; shift -= 4) {
+    int d = (int)((v >> shift) & 0xf);
+    buf[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+  }
+  (void)!write(STDERR_FILENO, buf, (size_t)n);
+}
+
+void write_str(const char *s) {
+  size_t n = 0;
+  while (s[n]) ++n;
+  (void)!write(STDERR_FILENO, s, n);
+}
+
 void crash_handler(int sig) {
   const char *name = signal_name(sig);
   if (g_in_sign_call) {
-    // 只允许 async-signal-safe 的 write。
-    const char msg[] = "[crash] sign core 调用期间崩溃: ";
-    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    (void)!write(STDERR_FILENO, name, strlen(name));
-    (void)!write(STDERR_FILENO, "\n", 1);
+    write_str("[crash] sign core 调用期间崩溃: ");
+    write_str(name);
+    write_str("\n[crash] 调用栈:\n");
+
+    // backtrace()/backtrace_symbols_fd() 在信号处理器里可用，
+    // 但为了拿到模块 + 偏移（比符号名更有用），这里逐个 dladdr。
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    for (int i = 0; i < n; ++i) {
+      Dl_info info{};
+      uintptr_t pc = (uintptr_t)frames[i];
+      write_str("  #");
+      char idx[8];
+      int m = 0;
+      if (i == 0) {
+        idx[m++] = '0';
+      } else {
+        int v = i, t[8], k = 0;
+        while (v) { t[k++] = v % 10; v /= 10; }
+        while (k) idx[m++] = (char)('0' + t[--k]);
+      }
+      (void)!write(STDERR_FILENO, idx, (size_t)m);
+      write_str("  ");
+      write_hex(pc);
+      if (dladdr(frames[i], &info) && info.dli_fname) {
+        // 只输出文件名，避免路径太长。
+        const char *base = info.dli_fname;
+        for (const char *q = info.dli_fname; *q; ++q) {
+          if (*q == '/') base = q + 1;
+        }
+        write_str("  ");
+        write_str(base);
+        if (info.dli_fbase) {
+          write_str("+");
+          write_hex(pc - (uintptr_t)info.dli_fbase);
+        }
+        if (info.dli_sname) {
+          write_str("  ");
+          write_str(info.dli_sname);
+        }
+      }
+      write_str("\n");
+    }
   }
   _exit(128 + sig);
 }
