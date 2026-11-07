@@ -164,7 +164,6 @@ jobs:
 
           echo
           echo "=== 定位 + 验证 ($ARCH) ==="
-          set +e
           rep="${REPEAT:-1}"
           if [ "$rep" = "1" ]; then
             m=$(printf '%s' "${COMMIT_MSG2:-}" | grep -o 'run-repeat:[[:space:]]*[0-9]*' || true)
@@ -174,20 +173,22 @@ jobs:
 
           # 默认同时验证 VM 分发器与 sign core：只有这两条都真正执行成功，
           # 才能说明这个版本可用。以前只调 sign core，VM 从未被执行过。
-          ./macos_vm_locator "$WRAPPER" "$ARCH" --repeat "$rep" --target both \
-            > "$RUNNER_TEMP/qq/result.txt" 2>&1
-          rc=$?
+          if ./macos_vm_locator "$WRAPPER" "$ARCH" --repeat "$rep" --target both \
+            > "$RUNNER_TEMP/qq/result.txt" 2>&1; then
+            verify_rc=0
+          else
+            verify_rc=$?
+          fi
           cat "$RUNNER_TEMP/qq/result.txt"
-          set -e
 
-          echo "exit=$rc"
+          echo "exit=$verify_rc"
 
           # 这里是真实验证：任何崩溃或错误都判红，不再降级成 warning。
-          if [ "$rc" -ge 128 ]; then
-            sig=$(kill -l $((rc-128)) 2>/dev/null || echo signal)
-            echo "::error::验证被 $sig 终止（exit=$rc）"
-          elif [ "$rc" -ne 0 ]; then
-            echo "::error::VM / sign core 验证未通过（exit=$rc）"
+          if [ "$verify_rc" -ge 128 ]; then
+            sig=$(kill -l "$((verify_rc-128))" 2>/dev/null || echo signal)
+            echo "::error::验证被 $sig 终止（exit=$verify_rc）"
+          elif [ "$verify_rc" -ne 0 ]; then
+            echo "::error::VM / sign core 验证未通过（exit=$verify_rc）"
           fi
           {
             echo "### $VERSION / $ARCH"
@@ -195,6 +196,8 @@ jobs:
             cat "$RUNNER_TEMP/qq/result.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$verify_rc"
 
 
       - name: 汇总到 artifact
