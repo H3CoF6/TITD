@@ -28,37 +28,34 @@ jobs:
         env:
           FILTER: ${{ inputs.versions }}
           ONLY_ARCH: ${{ inputs.only_arch }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           python3 - <<'PY'
           import json, os, re
 
-          # 版本 -> dmg 下载地址（来自 downloads.json 整理）。
-          # 注意：腾讯 CDN 只保留较新的版本。6.9.x 这批已全部 404，
-          # 仍然列出来是为了让 CI 如实报告“不可下载”，而不是悄悄消失。
+          # 直接读仓库里的 downloads.list.json，只取 macOS 的 dmg。
+          catalog = json.load(open("downloads.list.json"))
           CATALOG = {
-              "7.0.2.53644": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/837fcb63/QQ_v7.0.2.53644.dmg",
-              "7.0.2.53489": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/5947d5d1/QQ_v7.0.2.53489.dmg",
-              "7.0.1.52892": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.35/beta/110ab2aa/QQ_v7.0.1.52892.dmg",
-              "7.0.1.52804": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.35/beta/2e3af37e/QQ_v7.0.1.52804.dmg",
-              "7.0.0.52194": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/126b7ce6/QQ_v7.0.0.52194.dmg",
-              "7.0.0.52074": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/95242b5b/QQ_v7.0.0.52074.dmg",
-              "6.9.99.51802": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/57c59cd0/QQ_v6.9.99.51802.dmg",
-              "6.9.99.51728": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/cba20986/QQ_v6.9.99.51728.dmg",
-              "6.9.99.51552": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/beta/834b04f9/QQ_v6.9.99.51552.dmg",
-              "6.9.98.50969": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/beta/97487280/QQ_v6.9.98.50969.dmg",
-              "6.9.97.50828": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/beta/d2910fe0/QQ_v6.9.97.50828.dmg",
-              "6.9.97.50776": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/beta/4c16ad77/QQ_v6.9.97.50776.dmg",
-              "6.9.96.49738": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.31/beta/045f4292/QQ_v6.9.96.49738.dmg",
-              "6.9.96.49599": "https://qqdl.gtimg.cn/qqfile/QQNT/9.9.31/beta/6d42370f/QQ_v6.9.96.49599.dmg",
+              item["version"]: item["url"]
+              for item in catalog["items"]
+              if item["platform"] == "macos" and item["type"] == "dmg"
           }
 
-          filt = [v.strip() for v in os.environ.get("FILTER", "").split(",") if v.strip()]
+          # 过滤条件：workflow_dispatch 用 inputs.versions；
+          # push 触发时读 commit message 里的 `run-versions: 7.0.3`。
+          raw = os.environ.get("FILTER", "").strip()
+          if not raw and os.environ.get("EVENT_NAME") == "push":
+              msg = os.environ.get("COMMIT_MSG", "")
+              m = re.search(r"run-versions:\s*([\w.,]+)", msg)
+              if m:
+                  raw = m.group(1)
+          filt = [v.strip() for v in raw.split(",") if v.strip()]
           versions = [v for v in CATALOG if not filt or any(f in v for f in filt)]
+          print("filter:", filt or "(全部)", "->", versions)
 
-          # intel 跑在 macos-13（x86_64），arm 跑在 macos-14（arm64），
-          # 这样两个架构都能做动态签名验证。
-          # macOS 13/14 已退役；当前可用的是 macos-15（arm64）和
-          # macos-15-intel（x64）。
+          # macOS 13/14 的 runner 已退役；当前可用的是 macos-15（arm64）
+          # 和 macos-15-intel（x64），两个架构都能做动态签名验证。
           runners = {"intel": "macos-15-intel", "arm": "macos-15"}
           only = os.environ.get("ONLY_ARCH", "").strip()
           include = []
