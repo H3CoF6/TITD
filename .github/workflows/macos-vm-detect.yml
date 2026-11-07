@@ -24,6 +24,7 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
+      - uses: actions/checkout@v4
       - id: gen
         env:
           FILTER: ${{ inputs.versions }}
