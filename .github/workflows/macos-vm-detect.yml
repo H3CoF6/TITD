@@ -135,9 +135,24 @@ jobs:
           cd tools/macos_vm_locator
 
           echo "=== 提取 wrapper.node ==="
+          set +e
           WRAPPER="$(./extract_wrapper.sh "$RUNNER_TEMP/qq/qq.dmg" "$RUNNER_TEMP/qq/wrapper.node" 2>"$RUNNER_TEMP/qq/extract.log")"
+          ext_rc=$?
+          set -e
           cat "$RUNNER_TEMP/qq/extract.log"
+          echo "extract exit=$ext_rc"
           echo "wrapper = $WRAPPER"
+          if [ -z "$WRAPPER" ] || [ ! -f "$WRAPPER" ]; then
+            echo "::error::提取 wrapper.node 失败（exit=$ext_rc）"
+            {
+              echo "### $VERSION / $ARCH"
+              echo "提取失败（exit=$ext_rc）："
+              echo '```'
+              cat "$RUNNER_TEMP/qq/extract.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           ls -lh "$WRAPPER"
           file "$WRAPPER"
 
