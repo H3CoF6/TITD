@@ -20,7 +20,9 @@
 #include <string>
 #include <vector>
 
+#include <csignal>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
@@ -333,6 +335,32 @@ constexpr size_t kOutBuf = 0x400;
 constexpr size_t kSignLenOff = 0x2FF;
 constexpr size_t kSignDataOff = 0x200;
 
+// 调用 sign core 时若崩溃（arm64 上可能因为缺少初始化或依赖），
+// 捕获信号后打印诊断并退出，避免日志里只剩一个“段错误”。
+volatile sig_atomic_t g_in_sign_call = 0;
+
+const char *signal_name(int sig) {
+  switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS: return "SIGBUS";
+    case SIGILL: return "SIGILL";
+    case SIGABRT: return "SIGABRT";
+    default: return "signal";
+  }
+}
+
+void crash_handler(int sig) {
+  const char *name = signal_name(sig);
+  if (g_in_sign_call) {
+    // 只允许 async-signal-safe 的 write。
+    const char msg[] = "[crash] sign core 调用期间崩溃: ";
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)!write(STDERR_FILENO, name, strlen(name));
+    (void)!write(STDERR_FILENO, "\n", 1);
+  }
+  _exit(128 + sig);
+}
+
 bool load_and_sign(const char *path, uint64_t sign_rva, std::vector<uint8_t> *sign_out,
                    std::string *err) {
   // 提升自身为 RTLD_GLOBAL。
@@ -347,10 +375,22 @@ bool load_and_sign(const char *path, uint64_t sign_rva, std::vector<uint8_t> *si
     return false;
   }
 
+  // 先用 RTLD_LAZY：wrapper.node 依赖 Node 的 N-API 等宿主符号，
+  // RTLD_NOW 会立刻失败。sign core 本身不碰这些符号，所以懒绑定可行。
   void *lib = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
   if (!lib) {
     *err = std::string("dlopen wrapper.node 失败: ") + dlerror();
     return false;
+  }
+
+  // 顺带探一下 RTLD_NOW 缺什么符号，只用于诊断（不参与实际调用）。
+  dlerror();
+  void *probe = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (!probe) {
+    const char *e = dlerror();
+    std::printf("RTLD_NOW 未解析的符号 : %s\n", e ? e : "(未知)");
+  } else {
+    dlclose(probe);
   }
 
   uint64_t slide = module_slide(path);
@@ -363,7 +403,13 @@ bool load_and_sign(const char *path, uint64_t sign_rva, std::vector<uint8_t> *si
   std::vector<uint8_t> out(kOutBuf, 0);
   const uint8_t payload[] = {0x08, 0x01};
   const char *cmd = "trpc.qq_new_tech.status_svc.StatusService.SsoHeartBeat";
+  std::signal(SIGSEGV, crash_handler);
+  std::signal(SIGBUS, crash_handler);
+  std::signal(SIGILL, crash_handler);
+  std::signal(SIGABRT, crash_handler);
+  g_in_sign_call = 1;
   int ret = fn(cmd, payload, sizeof(payload), 1, out.data());
+  g_in_sign_call = 0;
 
   std::printf("dyld slide     : 0x%llx\n", (unsigned long long)slide);
   std::printf("sign core addr : 0x%llx\n", (unsigned long long)(slide + sign_rva));

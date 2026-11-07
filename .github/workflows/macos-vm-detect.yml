@@ -144,11 +144,15 @@ jobs:
           echo
           echo "=== 定位 + 验证 ($ARCH) ==="
           set +e
-          ./macos_vm_locator "$WRAPPER" "$ARCH" 2>&1 | tee "$RUNNER_TEMP/qq/result.txt"
-          rc=${PIPESTATUS[0]}
+          ./macos_vm_locator "$WRAPPER" "$ARCH" > "$RUNNER_TEMP/qq/result.txt" 2>&1
+          rc=$?
+          cat "$RUNNER_TEMP/qq/result.txt"
           set -e
 
           echo "exit=$rc"
+          if [ "$rc" -ge 128 ]; then
+            echo "::error::工具被信号终止（exit=$rc，$(kill -l $((rc-128)) 2>/dev/null || echo signal)）"
+          fi
           {
             echo "### $VERSION / $ARCH"
             echo '```'
