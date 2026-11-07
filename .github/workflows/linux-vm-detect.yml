@@ -1,0 +1,223 @@
+name: Linux VM detect
+
+# 手动触发，或推到本分支时自动跑。每个 QQ Linux 版本 × 架构各一个 job。
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: '逗号分隔的版本过滤（留空 = 全部）'
+        required: false
+        default: ''
+      only_arch:
+        description: '只跑某个架构（amd64 / arm64 / 留空 = 两个都跑）'
+        required: false
+        default: ''
+      repeat:
+        description: '每个 job 对 sign core 与 VM 各连续调用的次数（默认 1）'
+        required: false
+        default: "1"
+  push:
+    branches: [weq/linux-vm-detect]
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        env:
+          FILTER: ${{ inputs.versions }}
+          ONLY_ARCH: ${{ inputs.only_arch }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+
+          catalog = json.load(open("downloads.list.json"))
+          # 只取 Linux 的 .deb
+          ITEMS = [
+              item for item in catalog["items"]
+              if item["platform"] == "linux" and item["type"] == "deb"
+          ]
+
+          raw = os.environ.get("FILTER", "").strip()
+          if not raw and os.environ.get("EVENT_NAME") == "push":
+              m = re.search(r"run-versions:\s*([\w.,]+)", os.environ.get("COMMIT_MSG", ""))
+              if m:
+                  raw = m.group(1)
+          filt = [v.strip() for v in raw.split(",") if v.strip()]
+
+          only = os.environ.get("ONLY_ARCH", "").strip()
+          include = []
+          for item in ITEMS:
+              if filt and not any(f in item["version"] for f in filt):
+                  continue
+              arch = item["arch"]
+              if only and arch != only:
+                  continue
+              # amd64 跑在标准 x64 runner；arm64 用 GitHub 的免费 arm 跑器。
+              runner = "ubuntu-24.04-arm" if arch == "arm64" else "ubuntu-latest"
+              include.append({
+                  "version": item["version"],
+                  "arch": arch,
+                  "runner": runner,
+                  "url": item["url"],
+              })
+
+          matrix = json.dumps({"include": include})
+          print(matrix)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + matrix + "\n")
+          PY
+
+  detect:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.version }} / ${{ matrix.arch }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          echo "runner : ${{ matrix.runner }}"
+          uname -m
+          cat /etc/os-release | head -3
+
+      - name: 构建定位工具
+        working-directory: tools/linux_vm_locator
+        run: |
+          make
+          ./linux_vm_locator 2>&1 | head -3 || true
+
+      # 腾讯 CDN 经常把旧版本删掉，所以下载失败不判红、只记一条 warning。
+      - name: 下载 deb
+        id: download
+        env:
+          URL: ${{ matrix.url }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/qq"
+          code=$(curl -sSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/qq/qq.deb" \
+                   -w '%{http_code}' "$URL" || echo 000)
+          echo "http=$code"
+          if [ "$code" != "200" ] || [ ! -s "$RUNNER_TEMP/qq/qq.deb" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$VERSION 的 deb 已不可下载（http=$code）"
+            {
+              echo "### $VERSION / ${{ matrix.arch }}"
+              echo "deb 已不可下载（http=$code），跳过。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          ls -lh "$RUNNER_TEMP/qq/qq.deb"
+
+      # 只解包不安装：不需要 sudo，也不会污染 runner。
+      - name: 解包取 wrapper.node
+        id: extract
+        if: steps.download.outputs.available == 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          cd tools/linux_vm_locator
+          set +e
+          WRAPPER="$(./extract_wrapper.sh "$RUNNER_TEMP/qq/qq.deb" "$RUNNER_TEMP/qq/unpacked" 2>"$RUNNER_TEMP/qq/extract.log")"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/qq/extract.log" || true
+          echo "wrapper = $WRAPPER"
+          if [ -z "$WRAPPER" ] || [ ! -f "$WRAPPER" ]; then
+            echo "::error::解包失败（exit=$rc）"
+            {
+              echo "### $VERSION / $ARCH"
+              echo '```'
+              cat "$RUNNER_TEMP/qq/extract.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "wrapper=$WRAPPER" >> "$GITHUB_OUTPUT"
+          ls -lh "$WRAPPER"
+          file "$WRAPPER"
+          # 安装包本身（200MB+）解完就删；解出来的 app 目录要留着，
+          # 因为 wrapper.node 的 DT_NEEDED 依赖同目录的 .so。
+          rm -f "$RUNNER_TEMP/qq/qq.deb"
+          df -h "$RUNNER_TEMP"
+
+      - name: 定位 + 验证
+        id: verify
+        if: steps.extract.outputs.wrapper != ''
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ matrix.version }}
+          REPEAT: ${{ inputs.repeat || '1' }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          WRAPPER: ${{ steps.extract.outputs.wrapper }}
+        run: |
+          set -euo pipefail
+          cd tools/linux_vm_locator
+
+          rep="${REPEAT:-1}"
+          if [ "$rep" = "1" ] && [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            m=$(printf '%s' "${COMMIT_MSG:-}" | grep -o 'run-repeat:[[:space:]]*[0-9]*' || true)
+            if [ -n "$m" ]; then rep=$(printf '%s' "$m" | grep -o '[0-9]*'); fi
+          fi
+          echo "repeat=$rep"
+
+          # 同架构才做动态验证；异架构只做静态定位（工具内部会自动跳过调用）。
+          set +e
+          ./linux_vm_locator "$WRAPPER" --arch "${ARCH/amd64/x86_64}" --repeat "$rep" --target both \
+            > "$RUNNER_TEMP/qq/result.txt" 2>&1
+          verify_rc=$?
+          set -e
+          cat "$RUNNER_TEMP/qq/result.txt"
+
+          if [ "$verify_rc" -ge 128 ]; then
+            sig=$(kill -l "$((verify_rc-128))" 2>/dev/null || echo signal)
+            echo "::error::验证被 $sig 终止（exit=$verify_rc）"
+          elif [ "$verify_rc" -ne 0 ]; then
+            echo "::error::定位/验证未通过（exit=$verify_rc）"
+          fi
+
+          {
+            echo "### $VERSION / $ARCH"
+            echo '```'
+            cat "$RUNNER_TEMP/qq/result.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$verify_rc"
+
+      - name: 汇总到 artifact
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/qq/result.txt" \
+             "$RUNNER_TEMP/out/${{ matrix.version }}-${{ matrix.arch }}.txt" 2>/dev/null || true
+          cp "$RUNNER_TEMP/qq/extract.log" \
+             "$RUNNER_TEMP/out/${{ matrix.version }}-${{ matrix.arch }}-extract.log" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.version }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # runner 是一次性的，这里主要保证不在共享目录里留下大文件。
+      - name: 清理
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/qq"
+          df -h "$RUNNER_TEMP" || true
