@@ -329,15 +329,29 @@ extern "C" void qq_magic_napi_register(void *) {}
 
 using SignFn = int (*)(const char *cmd, const uint8_t *src, size_t len, int seq, uint8_t *out);
 
-// macOS 的 libc++ `std::string`（old ABI）：`{ ptr; size; cap_and_flag }`。
-// 布局与常见的 libstdc++ 相反的直觉不同；`cap_and_flag` 的最高位表示长串，
-// 低 63 位是容量（不是 `(cap << 1) | 1`）。
-struct LcxxString {
+// macOS 的 libc++ `std::string`（old ABI）在两个架构上布局不同：
+//
+//   arm64: `{ ptr; size; cap_and_flag }`，最高位是长串标记，低 63 位是容量；
+//   x86_64: `{ cap_and_flag; size; ptr }`，最低位是长串标记，`cap = value >> 1`。
+//
+// 这不是可以统一的结构，必须按目标架构分开，否则 VM 会把容量当指针写回。
+struct LcxxStringArm64 {
   char *ptr;
   size_t size;
   size_t cap_and_flag;
 };
-static_assert(sizeof(LcxxString) == 24, "libc++ string is 24 bytes");
+struct LcxxStringX86 {
+  size_t cap_and_flag;
+  size_t size;
+  char *ptr;
+};
+static_assert(sizeof(LcxxStringArm64) == 24, "arm64 libc++ string is 24 bytes");
+static_assert(sizeof(LcxxStringX86) == 24, "x86_64 libc++ string is 24 bytes");
+#if defined(__aarch64__)
+using LcxxString = LcxxStringArm64;
+#else
+using LcxxString = LcxxStringX86;
+#endif
 
 // x86_64 VM 分发器的真实签名（lldb 实测，7.0.0）：
 //   vm(out, b1, b2, cmd, mode, ctx)
@@ -550,9 +564,15 @@ LcxxString make_lcxx(std::vector<char> *storage, const void *data, size_t len) {
   storage->assign(static_cast<const char *>(data), static_cast<const char *>(data) + len);
   storage->push_back('\0');
   LcxxString s{};
+#if defined(__aarch64__)
   s.ptr = storage->data();
   s.size = len;
   s.cap_and_flag = (size_t{1} << 63) | static_cast<size_t>(len);
+#else
+  s.cap_and_flag = (static_cast<size_t>(len) << 1) | 1;
+  s.size = len;
+  s.ptr = storage->data();
+#endif
   return s;
 }
 
