@@ -111,7 +111,11 @@ jobs:
           path: |
             ${{ runner.temp }}/qq/qq.dmg
             ${{ runner.temp }}/qq/qq.dmg.ok
-          key: qq-dmg-${{ matrix.version }}-${{ matrix.arch }}
+          # dmg 与架构无关；同一版本两个架构共用一个缓存，避免 Intel/arm
+          # 各自从腾讯 CDN 重下 490MB。restore-keys 兼容旧的按架构 key。
+          key: qq-dmg-${{ matrix.version }}
+          restore-keys: |
+            qq-dmg-${{ matrix.version }}-
           save-always: true
 
       - name: 下载 dmg
