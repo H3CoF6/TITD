@@ -338,11 +338,14 @@ struct LcxxString {
 };
 static_assert(sizeof(LcxxString) == 24, "libc++ string is 24 bytes");
 
-// VM 分发器的真实签名（lldb 实测，x86_64 / 7.0.0）：
+// x86_64 VM 分发器的真实签名（lldb 实测，7.0.0）：
 //   vm(out, b1, b2, cmd, mode, ctx)
 // 五个参数都是 std::string*，`mode` 是 int（实测 3）。
 // `out` 由调用方提供并被原地写入；`ctx` 必须是合法 string（可为空），
 // 分发器会直接解引用它，传 NULL 会 SIGSEGV。
+//
+// arm64 的显式参数少一个：`out` 走 AAPCS64 的隐藏 sret 寄存器 x8，
+// 所以真实调用约定是 `vm(b1, b2, cmd, mode, ctx)`，返回值写入 x8。
 using VmFn = void (*)(LcxxString *, const LcxxString *, const LcxxString *, const LcxxString *,
                       int, const LcxxString *);
 
@@ -350,22 +353,20 @@ constexpr int kMacVmMode = 3;
 
 #if defined(__aarch64__)
 // AAPCS64 passes a >16-byte return value through the indirect-result register
-// x8. The arm64 dispatcher preserves x8 across its decryptor call and forwards
-// it to the real VM, so the caller must supply a writable libc++ std::string
-// slot (24 bytes). Calling it as a plain `void f(...)` leaves x8 undefined and
-// crashes inside the real VM.
-__attribute__((naked)) void call_vm_arm64(void *fn, LcxxString *out, const LcxxString *b1,
+// x8. The dispatcher saves x0..x4 and x8 before decrypting, restores them, and
+// branches to the real VM. The explicit arguments are therefore b1, b2, cmd,
+// mode, ctx (five, not six); `out` must be supplied in x8.
+__attribute__((naked)) void call_vm_arm64(void *fn, const LcxxString *b1,
                                           const LcxxString *b2, const LcxxString *cmd, int mode,
-                                          const LcxxString *ctx, LcxxString *ret) {
+                                          const LcxxString *ctx, LcxxString *out) {
   __asm__ volatile(
       "mov x9, x0\n"   // fn
-      "mov x0, x1\n"   // out
-      "mov x1, x2\n"   // b1
-      "mov x2, x3\n"   // b2
-      "mov x3, x4\n"   // cmd
-      "mov w4, w5\n"   // mode
-      "mov x5, x6\n"   // ctx
-      "mov x8, x7\n"   // sret
+      "mov x0, x1\n"   // b1
+      "mov x1, x2\n"   // b2
+      "mov x2, x3\n"   // cmd
+      "mov w3, w4\n"   // mode
+      "mov x4, x5\n"   // ctx
+      "mov x8, x6\n"   // hidden sret: out
       "blr x9\n"
       "ret\n");
 }
@@ -574,13 +575,10 @@ int call_vm(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
   std::signal(SIGABRT, crash_handler);
   g_in_sign_call = 1;
 #if defined(__aarch64__)
-  LcxxString ret{};
-  call_vm_arm64(reinterpret_cast<void *>(fn), &out, &s_md5, &s_empty, &s_cmd, kMacVmMode,
-                &s_ctx, &ret);
-  std::fprintf(stderr, "[vm] out=%p/%zu ret=%p/%zu\n",
-               static_cast<void *>(out.ptr), out.size,
-               static_cast<void *>(ret.ptr), ret.size);
-  const LcxxString &result = (ret.size > 0 && ret.ptr) ? ret : out;
+  call_vm_arm64(reinterpret_cast<void *>(fn), &s_md5, &s_empty, &s_cmd, kMacVmMode, &s_ctx,
+                &out);
+  std::fprintf(stderr, "[vm] out=%p/%zu\n", static_cast<void *>(out.ptr), out.size);
+  const LcxxString &result = out;
 #else
   fn(&out, &s_md5, &s_empty, &s_cmd, kMacVmMode, &s_ctx);
   const LcxxString &result = out;
