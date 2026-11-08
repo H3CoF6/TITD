@@ -137,15 +137,20 @@ jobs:
                    -w '%{http_code}' "$URL" || echo 000)
           size=$(stat -c%s "$RUNNER_TEMP/qq/qq.exe" 2>/dev/null || echo 0)
           echo "http=$code size=$size"
-          if [ "$code" != "200" ] || [ "$size" -lt 10000000 ]; then
-            # 腾讯 CDN 会删旧版本；不可下载只记 warning，不判红。
+          if [ "$code" = "403" ] || [ "$code" = "404" ]; then
+            # 腾讯 CDN 会删旧版本：这两个码算「该版本已下架」，只记 warning。
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::${VERSION} 的安装包已不可下载（http=${code} size=${size}）"
+            echo "::warning::${VERSION} 的安装包已下架（http=${code}）"
             {
               echo "### $VERSION / ${{ matrix.arch }}"
-              echo "安装包已不可下载（http=${code} size=${size}）。"
+              echo "安装包已下架（http=${code}），跳过。"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          fi
+          if [ "$code" != "200" ] || [ "$size" -lt 10000000 ]; then
+            # 其它（连接重置、超时、返回 HTML）是真失败：判红，别假装验过。
+            echo "::error::${VERSION} 的安装包下载失败（http=${code} size=${size} url=${URL}）"
+            exit 1
           fi
           echo "available=true" >> "$GITHUB_OUTPUT"
           ls -lh "$RUNNER_TEMP/qq/qq.exe"
