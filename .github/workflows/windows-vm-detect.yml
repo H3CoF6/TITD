@@ -160,17 +160,51 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $target = Join-Path $env:RUNNER_TEMP 'qq\installed'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
           Write-Host "installing to $target"
+
+          # NSIS 的 /D= 必须是**最后**一个参数且不能加引号；PowerShell 的
+          # -ArgumentList 会自作主张加引号，所以拼成一个字符串交给它。
+          # 另外 QQ 的安装器可能把 /S 当成「下载器已启动」就立刻返回，
+          # 所以装完还要轮询等待文件出现。
+          $installerArgs = "/S /D=$target"
+          Write-Host "args: $installerArgs"
           $p = Start-Process -FilePath (Join-Path $env:RUNNER_TEMP 'qq\qq.exe') `
-            -ArgumentList '/S', "/D=$target" -Wait -PassThru
+            -ArgumentList $installerArgs -Wait -PassThru
           Write-Host "installer exit=$($p.ExitCode)"
 
-          $wrapper = Get-ChildItem -Path $target -Recurse -Filter 'wrapper.node' -ErrorAction SilentlyContinue |
-            Sort-Object Length -Descending | Select-Object -First 1
+          $candidates = @(
+            $target,
+            "$env:ProgramFiles\Tencent\QQNT",
+            "${env:ProgramFiles(x86)}\Tencent\QQNT",
+            "$env:LOCALAPPDATA\Programs\Tencent\QQNT",
+            "$env:USERPROFILE\AppData\Roaming\Tencent\QQNT"
+          )
+
+          $wrapper = $null
+          for ($attempt = 0; $attempt -lt 30 -and -not $wrapper; $attempt++) {
+            foreach ($root in $candidates) {
+              if (-not (Test-Path $root)) { continue }
+              $wrapper = Get-ChildItem -Path $root -Recurse -Filter 'wrapper.node' `
+                -ErrorAction SilentlyContinue |
+                Sort-Object Length -Descending | Select-Object -First 1
+              if ($wrapper) {
+                Write-Host "found under $root"
+                break
+              }
+            }
+            if (-not $wrapper) { Start-Sleep -Seconds 5 }
+          }
+
           if (-not $wrapper) {
             Write-Host "::error::解包后没找到 wrapper.node"
-            Get-ChildItem -Path $target -Recurse -Depth 3 -ErrorAction SilentlyContinue |
-              Select-Object -First 50 FullName | Out-String | Write-Host
+            foreach ($root in $candidates) {
+              Write-Host "--- $root exists=$(Test-Path $root)"
+              if (Test-Path $root) {
+                Get-ChildItem -Path $root -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+                  Select-Object -First 30 FullName | Out-String | Write-Host
+              }
+            }
             exit 1
           }
           Write-Host "wrapper = $($wrapper.FullName) ($('{0:N0}' -f $wrapper.Length) bytes)"
