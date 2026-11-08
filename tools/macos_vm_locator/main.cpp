@@ -348,6 +348,29 @@ using VmFn = void (*)(LcxxString *, const LcxxString *, const LcxxString *, cons
 
 constexpr int kMacVmMode = 3;
 
+#if defined(__aarch64__)
+// AAPCS64 passes a >16-byte return value through the indirect-result register
+// x8. The arm64 dispatcher preserves x8 across its decryptor call and forwards
+// it to the real VM, so the caller must supply a writable libc++ std::string
+// slot (24 bytes). Calling it as a plain `void f(...)` leaves x8 undefined and
+// crashes inside the real VM.
+__attribute__((naked)) void call_vm_arm64(void *fn, LcxxString *out, const LcxxString *b1,
+                                          const LcxxString *b2, const LcxxString *cmd, int mode,
+                                          const LcxxString *ctx, LcxxString *ret) {
+  __asm__ volatile(
+      "mov x9, x0\n"   // fn
+      "mov x0, x1\n"   // out
+      "mov x1, x2\n"   // b1
+      "mov x2, x3\n"   // b2
+      "mov x3, x4\n"   // cmd
+      "mov w4, w5\n"   // mode
+      "mov x5, x6\n"   // ctx
+      "mov x8, x7\n"   // sret
+      "blr x9\n"
+      "ret\n");
+}
+#endif
+
 // 运行时 slide：wrapper.node 在 dyld 里的加载基址。
 uint64_t module_slide(const char *path);
 
@@ -550,14 +573,25 @@ int call_vm(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
   std::signal(SIGILL, crash_handler);
   std::signal(SIGABRT, crash_handler);
   g_in_sign_call = 1;
+#if defined(__aarch64__)
+  LcxxString ret{};
+  call_vm_arm64(reinterpret_cast<void *>(fn), &out, &s_md5, &s_empty, &s_cmd, kMacVmMode,
+                &s_ctx, &ret);
+  std::fprintf(stderr, "[vm] out=%p/%zu ret=%p/%zu\n",
+               static_cast<void *>(out.ptr), out.size,
+               static_cast<void *>(ret.ptr), ret.size);
+  const LcxxString &result = (ret.size > 0 && ret.ptr) ? ret : out;
+#else
   fn(&out, &s_md5, &s_empty, &s_cmd, kMacVmMode, &s_ctx);
+  const LcxxString &result = out;
+#endif
   g_in_sign_call = 0;
 
-  if (out.size == 0 || out.size > 0x100 || !out.ptr) {
+  if (result.size == 0 || result.size > 0x100 || !result.ptr) {
     return -1;
   }
-  sign_out->assign(reinterpret_cast<uint8_t *>(out.ptr),
-                   reinterpret_cast<uint8_t *>(out.ptr) + out.size);
+  sign_out->assign(reinterpret_cast<uint8_t *>(result.ptr),
+                   reinterpret_cast<uint8_t *>(result.ptr) + result.size);
   return 0;
 }
 
