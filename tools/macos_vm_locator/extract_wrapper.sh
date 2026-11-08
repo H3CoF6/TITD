@@ -29,7 +29,10 @@ find_in_dir() {
 
 try_mount() {
   local image="$1"
-  if hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$image" >/dev/null 2>&1; then
+  # host 上的 hdiutil 偶尔会卡在 compressed image / 坏分区表上；给它一个硬超时。
+  if perl -e 'alarm shift; exec @ARGV' 120 \
+      hdiutil attach -nobrowse -readonly -noautoopen -noverify -mountpoint "$MOUNT" \
+      "$image" >/dev/null 2>&1; then
     local found
     found="$(find_in_dir "$MOUNT")"
     if [ -n "$found" ]; then
@@ -43,21 +46,21 @@ try_mount() {
   return 1
 }
 
-# 1) 直接挂载
-log "尝试直接 hdiutil attach"
-try_mount "$DMG" && exit 0
-
-# 2) 解 bzip2 再挂载
+# 腾讯现在的 dmg 外层就是 bzip2，而不是标准 UDIF。先解压再 attach，
+# 避免 hdiutil 在压缩镜像上空转。
 RAW="$DMG"
 if head -c 3 "$DMG" | grep -q 'BZh'; then
-  log "dmg 是 bzip2，先解压"
+  log "dmg 是 bzip2，先解压（跳过直接 attach）"
   bunzip2 -c "$DMG" > "$WORK/raw.dmg" 2>/dev/null || cp "$DMG" "$WORK/raw.dmg"
   RAW="$WORK/raw.dmg"
   log "尝试挂载解压后的镜像"
   try_mount "$RAW" && exit 0
+else
+  log "尝试直接 hdiutil attach"
+  try_mount "$DMG" && exit 0
 fi
 
-# 3) 兜底：扫描 fat Mach-O（只得到单文件，依赖 framework 会缺失）
+# 兜底：扫描 fat Mach-O（只得到单文件，依赖 framework 会缺失）
 log "hdiutil 挂载失败，改为扫描镜像"
 python3 "$HERE/scan_wrapper.py" "$RAW" "$OUT"
 log "提取完成: $OUT（仅单文件）"

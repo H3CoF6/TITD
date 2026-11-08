@@ -395,6 +395,7 @@ const char *signal_name(int sig) {
     case SIGBUS: return "SIGBUS";
     case SIGILL: return "SIGILL";
     case SIGABRT: return "SIGABRT";
+    case SIGALRM: return "SIGALRM(timeout)";
     default: return "signal";
   }
 }
@@ -573,7 +574,14 @@ int call_vm(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
   std::signal(SIGBUS, crash_handler);
   std::signal(SIGILL, crash_handler);
   std::signal(SIGABRT, crash_handler);
+  std::signal(SIGALRM, crash_handler);
   g_in_sign_call = 1;
+  std::fprintf(stderr, "[vm] calling dispatcher fn=%p b1=%p b2=%p cmd=%p mode=%d ctx=%p out=%p\n",
+               fn_ptr, static_cast<const void *>(&s_md5), static_cast<const void *>(&s_empty),
+               static_cast<const void *>(&s_cmd), kMacVmMode, static_cast<const void *>(&s_ctx),
+               static_cast<void *>(&out));
+  std::fflush(stderr);
+  alarm(30);
 #if defined(__aarch64__)
   call_vm_arm64(reinterpret_cast<void *>(fn), &s_md5, &s_empty, &s_cmd, kMacVmMode, &s_ctx,
                 &out);
@@ -583,6 +591,9 @@ int call_vm(void *fn_ptr, int seq, std::vector<uint8_t> *sign_out) {
   fn(&out, &s_md5, &s_empty, &s_cmd, kMacVmMode, &s_ctx);
   const LcxxString &result = out;
 #endif
+  alarm(0);
+  std::fprintf(stderr, "[vm] returned out=%p/%zu\n", static_cast<void *>(out.ptr), out.size);
+  std::fflush(stderr);
   g_in_sign_call = 0;
 
   if (result.size == 0 || result.size > 0x100 || !result.ptr) {
