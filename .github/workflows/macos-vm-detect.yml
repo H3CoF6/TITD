@@ -112,6 +112,7 @@ jobs:
             ${{ runner.temp }}/qq/qq.dmg
             ${{ runner.temp }}/qq/qq.dmg.ok
           key: qq-dmg-${{ matrix.version }}-${{ matrix.arch }}
+          save-always: true
 
       - name: 下载 dmg
         id: download

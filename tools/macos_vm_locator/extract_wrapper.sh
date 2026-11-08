@@ -31,8 +31,7 @@ try_mount() {
   local image="$1"
   # host 上的 hdiutil 偶尔会卡在 compressed image / 坏分区表上；给它一个硬超时。
   if perl -e 'alarm shift; exec @ARGV' 120 \
-      hdiutil attach -nobrowse -readonly -noautoopen -noverify -mountpoint "$MOUNT" \
-      "$image" >/dev/null 2>&1; then
+      hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$image" >/dev/null 2>&1; then
     local found
     found="$(find_in_dir "$MOUNT")"
     if [ -n "$found" ]; then
@@ -46,18 +45,19 @@ try_mount() {
   return 1
 }
 
-# 腾讯现在的 dmg 外层就是 bzip2，而不是标准 UDIF。先解压再 attach，
-# 避免 hdiutil 在压缩镜像上空转。
+# 先按原样挂载：腾讯的 .dmg 虽是 bzip2 外层，但 macOS 的 hdiutil 能直接处理，
+# 且只有挂载路径才能保留 ScreenCaptureAgent.framework 等 @loader_path 依赖。
+# 挂载本身有 120 秒超时，失败后再解压/扫描。
+log "尝试直接 hdiutil attach"
+try_mount "$DMG" && exit 0
+
 RAW="$DMG"
 if head -c 3 "$DMG" | grep -q 'BZh'; then
-  log "dmg 是 bzip2，先解压（跳过直接 attach）"
+  log "直接挂载失败，解压后再试"
   bunzip2 -c "$DMG" > "$WORK/raw.dmg" 2>/dev/null || cp "$DMG" "$WORK/raw.dmg"
   RAW="$WORK/raw.dmg"
   log "尝试挂载解压后的镜像"
   try_mount "$RAW" && exit 0
-else
-  log "尝试直接 hdiutil attach"
-  try_mount "$DMG" && exit 0
 fi
 
 # 兜底：扫描 fat Mach-O（只得到单文件，依赖 framework 会缺失）
