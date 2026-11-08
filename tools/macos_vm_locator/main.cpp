@@ -355,19 +355,25 @@ constexpr int kMacVmMode = 3;
 // AAPCS64 passes a >16-byte return value through the indirect-result register
 // x8. The dispatcher saves x0..x4 and x8 before decrypting, restores them, and
 // branches to the real VM. The explicit arguments are therefore b1, b2, cmd,
-// mode, ctx (five, not six); `out` must be supplied in x8.
+// mode, ctx (five, not six); `out` must be supplied in x8. Because the
+// dispatcher tail-branches, `blr` must save the caller's x30 on the stack or
+// the final `ret` returns to itself.
 __attribute__((naked)) void call_vm_arm64(void *fn, const LcxxString *b1,
                                           const LcxxString *b2, const LcxxString *cmd, int mode,
                                           const LcxxString *ctx, LcxxString *out) {
   __asm__ volatile(
-      "mov x9, x0\n"   // fn
-      "mov x0, x1\n"   // b1
-      "mov x1, x2\n"   // b2
-      "mov x2, x3\n"   // cmd
-      "mov w3, w4\n"   // mode
-      "mov x4, x5\n"   // ctx
-      "mov x8, x6\n"   // hidden sret: out
+      "sub sp, sp, #16\n"
+      "str x30, [sp, #8]\n"  // caller LR: blr below overwrites x30
+      "mov x9, x0\n"         // fn
+      "mov x0, x1\n"         // b1
+      "mov x1, x2\n"         // b2
+      "mov x2, x3\n"         // cmd
+      "mov w3, w4\n"         // mode
+      "mov x4, x5\n"         // ctx
+      "mov x8, x6\n"         // hidden sret: out
       "blr x9\n"
+      "ldr x30, [sp, #8]\n"
+      "add sp, sp, #16\n"
       "ret\n");
 }
 #endif
