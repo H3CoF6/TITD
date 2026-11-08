@@ -63,5 +63,5 @@ fi
 # 兜底：扫描 fat Mach-O（只得到单文件，依赖 framework 会缺失）
 log "hdiutil 挂载失败，改为扫描镜像"
 python3 "$HERE/scan_wrapper.py" "$RAW" "$OUT"
-log "提取完成: $OUT（仅单文件）"
+log "提取完成: ${OUT}（仅单文件）"
 echo "$OUT"

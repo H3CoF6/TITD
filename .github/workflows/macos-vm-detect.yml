@@ -141,10 +141,10 @@ jobs:
           fi
           if [ "$code" != "200" ] || [ ! -s "$RUNNER_TEMP/qq/qq.dmg" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::$VERSION 的 dmg 下载失败（curl rc=${rc:-?} http=$code）"
+            echo "::warning::${VERSION} 的 dmg 下载失败（curl rc=${rc:-?} http=${code}）"
             {
               echo "### $VERSION / ${{ matrix.arch }}"
-              echo "dmg 下载失败（curl rc=${rc:-?} http=$code），跳过。"
+              echo "dmg 下载失败（curl rc=${rc:-?} http=${code}），跳过。"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -172,10 +172,10 @@ jobs:
           echo "extract exit=$ext_rc $(date -u +%FT%TZ)"
           echo "wrapper = $WRAPPER"
           if [ -z "$WRAPPER" ] || [ ! -f "$WRAPPER" ]; then
-            echo "::error::提取 wrapper.node 失败（exit=$ext_rc）"
+            echo "::error::提取 wrapper.node 失败（exit=${ext_rc}）"
             {
               echo "### $VERSION / ${{ matrix.arch }}"
-              echo "提取失败（exit=$ext_rc）："
+              echo "提取失败（exit=${ext_rc}）："
               echo '```'
               cat "$RUNNER_TEMP/qq/extract.log"
               echo '```'
@@ -224,9 +224,9 @@ jobs:
           # 这里是真实验证：任何崩溃或错误都判红，不再降级成 warning。
           if [ "$verify_rc" -ge 128 ]; then
             sig=$(kill -l "$((verify_rc-128))" 2>/dev/null || echo signal)
-            echo "::error::验证被 $sig 终止（exit=$verify_rc）"
+            echo "::error::验证被 ${sig} 终止（exit=${verify_rc}）"
           elif [ "$verify_rc" -ne 0 ]; then
-            echo "::error::VM / sign core 验证未通过（exit=$verify_rc）"
+            echo "::error::VM / sign core 验证未通过（exit=${verify_rc}）"
           fi
           {
             echo "### $VERSION / $ARCH"
